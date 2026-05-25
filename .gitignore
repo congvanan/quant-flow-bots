@@ -1,0 +1,33 @@
+# Build output
+bin/
+obj/
+node_modules/
+.next/
+dist/
+out/
+
+# Secrets / env
+.env
+.env.local
+.env.*.local
+appsettings.Development.json
+appsettings.Local.json
+
+# IDE / editor
+*.user
+*.suo
+*.tsbuildinfo
+.vs/
+.idea/
+
+# Logs / runtime artifacts
+*.log
+.api-log.txt
+.api-err.txt
+.worker-log.txt
+.worker-err.txt
+build.log
+
+# Temp / scratch dirs from local dev
+.temp-verify/
+.tmp/
