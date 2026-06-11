@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react'
-import { Trash2 } from 'lucide-react'
+import { Pencil, Trash2 } from 'lucide-react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AuthGuard } from '@/components/auth-guard'
 import { NavBar } from '@/components/nav-bar'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { Badge } from '@/components/ui/badge'
 import { api, ApiError, type StrategyDto } from '@/lib/api'
 import { qk } from '@/lib/queries'
 
@@ -65,6 +65,17 @@ const STRATEGY_DOCS: Record<string, StrategyDoc> = {
       { key: 'direction', type: 'enum', default: 'both', options: ['buy', 'sell', 'both'], desc: 'Chiều entry chấp nhận.' },
     ],
     note: 'Metadata kèm tín hiệu: `vwapAboveMa` (true = lý trí > cảm xúc → setup bền) · `maDistanceFromVwapPct` lớn = đang pump quá đà.',
+  },
+  vwap_ma_stretch: {
+    summary: 'COUNTER-TREND mean-reversion: vào lệnh ngược chiều khi GIÁ cách MA ≥ X% VÀ MA cách VWAP ≥ Y%. Stretched↑ → SELL (overheated), stretched↓ → BUY (oversold). Khác vwap_emotion_cross (đi theo breakout) — chiến lược này đi ngược stretch.',
+    params: [
+      { key: 'maPeriod', type: 'enum', default: 20, options: ['20', '28'], desc: 'MA cảm xúc — chọn 20 hoặc 28.' },
+      { key: 'vwapAnchor', type: 'enum', default: 'daily', options: ['daily', 'weekly', 'monthly'], desc: 'VWAP neo theo phiên. daily/weekly → interval 1h; monthly → interval 2h.' },
+      { key: 'priceMaDistancePct', type: 'number', default: 5, desc: 'Tối thiểu |Price − MA| / MA × 100 (%). Default 5%. Nhỏ → nhiều signal yếu, lớn → ít signal nhưng setup mạnh.' },
+      { key: 'maVwapDistancePct', type: 'number', default: 5, desc: 'Tối thiểu |MA − VWAP| / VWAP × 100 (%). Default 5%. "Cảm xúc đã xa lý trí bao nhiêu".' },
+      { key: 'direction', type: 'enum', default: 'both', options: ['buy', 'sell', 'both'], desc: 'buy = chỉ bắt đáy stretched↓, sell = chỉ short đỉnh stretched↑, both = cả 2.' },
+    ],
+    note: 'Lưu ý "giá hiện tại chưa kết thúc nến": framework fire khi nến đóng, nên dùng close gần nhất làm proxy. Muốn bám sát tick → config bot interval=1m (chấp nhận noise cao). Metadata kèm: `priceMaDistPct`, `maVwapDistPct` ký dấu (dương=above, âm=below).',
   },
   sentiment_momentum: {
     summary: 'Rolling sentiment score từ tin tức scraped + manual — vượt threshold thì BUY.',
@@ -132,6 +143,10 @@ function Inner() {
   const [kind, setKind] = useState('sma_cross')
   const [params, setParams] = useState(() => defaultsJsonFor('sma_cross'))
   const [err, setErr] = useState<string | null>(null)
+  // Edit mode: null = create, string = edit id. Khi vào edit mode form load values cũ +
+  // submit button đổi sang "Save changes". Kind dropdown disabled (đổi kind = strategy khác,
+  // user nên Clone).
+  const [editingId, setEditingId] = useState<string | null>(null)
 
   const { data: list = [] } = useQuery({
     queryKey: qk.strategies,
@@ -143,13 +158,26 @@ function Inner() {
     staleTime: Infinity,
   })
 
-  useEffect(() => { setParams(defaultsJsonFor(kind)) }, [kind])
+  // Reset params chỉ khi đổi kind ở create mode. Ở edit mode giữ nguyên params đã load.
+  useEffect(() => {
+    if (editingId === null) setParams(defaultsJsonFor(kind))
+  }, [kind, editingId])
 
   const createMut = useMutation({
     mutationFn: (body: { name: string; kind: string; parametersJson: string }) =>
       api('/api/strategies', { method: 'POST', body: JSON.stringify(body) }),
     onSuccess: () => {
-      setName('')
+      resetForm()
+      qc.invalidateQueries({ queryKey: qk.strategies })
+    },
+    onError: (e) => setErr(e instanceof ApiError ? e.message : (e as Error).message),
+  })
+
+  const updateMut = useMutation({
+    mutationFn: (body: { id: string; name: string; parametersJson: string }) =>
+      api(`/api/strategies/${body.id}`, { method: 'PATCH', body: JSON.stringify({ name: body.name, parametersJson: body.parametersJson }) }),
+    onSuccess: () => {
+      resetForm()
       qc.invalidateQueries({ queryKey: qk.strategies })
     },
     onError: (e) => setErr(e instanceof ApiError ? e.message : (e as Error).message),
@@ -159,6 +187,24 @@ function Inner() {
     mutationFn: (id: string) => api(`/api/strategies/${id}`, { method: 'DELETE' }),
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.strategies }),
   })
+
+  function resetForm() {
+    setEditingId(null)
+    setName('')
+    setKind('sma_cross')
+    setParams(defaultsJsonFor('sma_cross'))
+    setErr(null)
+  }
+
+  function startEdit(s: StrategyDto) {
+    setEditingId(s.id)
+    setName(s.name)
+    setKind(s.kind)
+    setParams(s.parametersJson)
+    setErr(null)
+    // Scroll lên đầu form để mobile/short viewport thấy ngay.
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
 
   function submit(e: React.FormEvent) {
     e.preventDefault()
@@ -171,49 +217,97 @@ function Inner() {
       setErr('Invalid JSON: ' + (e as Error).message)
       return
     }
-    createMut.mutate({ name, kind, parametersJson: params })
+
+    if (editingId) {
+      // Cảnh báo khi có bot Running — params mới sẽ áp dụng từ nến tiếp theo.
+      const target = list.find(s => s.id === editingId)
+      if (target && target.runningBotCount > 0) {
+        if (!confirm(`${target.runningBotCount} bot đang chạy strategy này. Params mới sẽ áp dụng từ nến tiếp theo. Tiếp tục?`)) return
+      }
+      updateMut.mutate({ id: editingId, name, parametersJson: params })
+    } else {
+      createMut.mutate({ name, kind, parametersJson: params })
+    }
   }
 
   function remove(id: string) {
     if (!confirm('Delete strategy?')) return
     removeMut.mutate(id)
+    // Nếu đang edit chính strategy bị xóa → reset form.
+    if (editingId === id) resetForm()
   }
+
+  const isEditing = editingId !== null
+  const isSubmitting = createMut.isPending || updateMut.isPending
 
   return (
     <main className="min-h-screen">
       <NavBar />
-      <div className="container grid gap-5 py-5 lg:grid-cols-[1fr_380px]">
-        <Card>
+      {/* minmax(0,1fr) thay vì 1fr: cho phép cột trái shrink xuống dưới content width khi
+          params JSON dài. 1fr mặc định có min-width:auto → con dài thì cột phình ra → cột phải
+          bị đẩy ra ngoài viewport. */}
+      <div className="container grid gap-5 py-5 lg:grid-cols-[minmax(0,1fr)_380px]">
+        <Card className="min-w-0">
           <CardHeader><CardTitle>Strategies</CardTitle></CardHeader>
           <CardContent>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Name</TableHead><TableHead>Kind</TableHead><TableHead>Params</TableHead><TableHead></TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {list.map(s => (
-                  <TableRow key={s.id}>
-                    <TableCell className="font-medium">{s.name}</TableCell>
-                    <TableCell>{s.kind}</TableCell>
-                    <TableCell className="font-mono text-xs">{s.parametersJson}</TableCell>
-                    <TableCell><Button size="sm" variant="ghost" onClick={() => remove(s.id)}><Trash2 className="h-4 w-4 text-destructive" /></Button></TableCell>
-                  </TableRow>
-                ))}
-                {list.length === 0 && <TableRow><TableCell colSpan={4} className="text-muted-foreground">No strategies yet.</TableCell></TableRow>}
-              </TableBody>
-            </Table>
+            {/* Card-per-strategy thay cho table: name + kind chip ở header dòng, params wrap
+                xuống dưới (font-mono, break-all). Trash nằm fixed bên phải nên luôn click được
+                không cần scroll ngang. Tránh hoàn toàn vấn đề header bị clip + button trôi
+                ngoài viewport khi params JSON dài. */}
+            <div className="space-y-2">
+              {list.map(s => {
+                const isActive = editingId === s.id
+                return (
+                  <div
+                    key={s.id}
+                    className={`flex items-start justify-between gap-3 rounded-md border px-3 py-2.5 ${
+                      isActive ? 'border-primary bg-primary/5' : 'border-border bg-surface/40'
+                    }`}
+                  >
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-sm font-medium">{s.name}</span>
+                        <Badge variant="outline" className="font-mono text-[10px]">{s.kind}</Badge>
+                        {s.runningBotCount > 0 && (
+                          <Badge className="bg-up/15 text-up text-[10px]" title="Số bot đang Running dùng strategy này">
+                            {s.runningBotCount} bot live
+                          </Badge>
+                        )}
+                      </div>
+                      <div className="mt-1 break-all font-mono text-[11px] leading-relaxed text-muted-foreground">
+                        {s.parametersJson}
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-0.5">
+                      <Button size="sm" variant="ghost" onClick={() => startEdit(s)} title="Edit">
+                        <Pencil className="h-4 w-4" />
+                      </Button>
+                      <Button size="sm" variant="ghost" onClick={() => remove(s.id)} title="Delete">
+                        <Trash2 className="h-4 w-4 text-destructive" />
+                      </Button>
+                    </div>
+                  </div>
+                )
+              })}
+              {list.length === 0 && (
+                <p className="py-6 text-center text-sm text-muted-foreground">No strategies yet.</p>
+              )}
+            </div>
           </CardContent>
         </Card>
 
         <Card>
-          <CardHeader><CardTitle>Create strategy</CardTitle></CardHeader>
+          <CardHeader><CardTitle>{isEditing ? 'Edit strategy' : 'Create strategy'}</CardTitle></CardHeader>
           <CardContent>
             <form onSubmit={submit} className="space-y-3">
               <Field label="Name"><input className="w-full rounded-md border px-3 py-2 text-sm" value={name} onChange={e => setName(e.target.value)} required /></Field>
-              <Field label="Kind">
-                <select className="w-full rounded-sm border border-border bg-surface px-3 py-2 text-sm text-foreground" value={kind} onChange={e => setKind(e.target.value)}>
+              <Field label={isEditing ? 'Kind (không đổi được khi edit — clone để đổi kind)' : 'Kind'}>
+                <select
+                  className="w-full rounded-sm border border-border bg-surface px-3 py-2 text-sm text-foreground disabled:opacity-60"
+                  value={kind}
+                  onChange={e => setKind(e.target.value)}
+                  disabled={isEditing}
+                >
                   {kinds.map(k => <option key={k} value={k}>{k}</option>)}
                 </select>
               </Field>
@@ -229,7 +323,16 @@ function Inner() {
               <ParamGuide doc={STRATEGY_DOCS[kind]} onResetDefaults={() => setParams(defaultsJsonFor(kind))} />
 
               {err && <p className="text-sm text-destructive">{err}</p>}
-              <Button type="submit" className="w-full" disabled={createMut.isPending}>{createMut.isPending ? 'Saving...' : 'Create'}</Button>
+              <div className="flex gap-2">
+                <Button type="submit" className="flex-1" disabled={isSubmitting}>
+                  {isSubmitting ? 'Saving...' : isEditing ? 'Save changes' : 'Create'}
+                </Button>
+                {isEditing && (
+                  <Button type="button" variant="outline" onClick={resetForm} disabled={isSubmitting}>
+                    Cancel
+                  </Button>
+                )}
+              </div>
             </form>
           </CardContent>
         </Card>
