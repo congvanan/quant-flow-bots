@@ -31,3 +31,4 @@ build.log
 # Temp / scratch dirs from local dev
 .temp-verify/
 .tmp/
+logs/
