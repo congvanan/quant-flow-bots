@@ -14,6 +14,31 @@ public static class MarketEndpoints
     {
         var grp = app.MapGroup("/api/market").WithTags("market");
 
+        grp.MapGet("/alpha", async (AlphaMarketService alpha, CancellationToken ct) =>
+        {
+            var tokens = await alpha.GetAsync(ct);
+            return Results.Ok(new
+            {
+                updatedAt = tokens.Count > 0 ? tokens[0].At : DateTimeOffset.UtcNow,
+                count = tokens.Count,
+                items = tokens,
+            });
+        });
+
+        // Lightweight endpoint cho FE poll 2s. Trả thẳng snapshot từ AlphaPriceCache
+        // (được AlphaPriceStreamWorker đẩy realtime qua WS @ticker). Payload ~50 bytes/symbol
+        // × 222 ≈ 11KB/poll. Không touch sparkline/marketCap (đó là endpoint /alpha riêng).
+        grp.MapGet("/alpha/prices", (AlphaPriceCache cache) =>
+        {
+            var ticks = cache.Snapshot();
+            return Results.Ok(new
+            {
+                updatedAt = DateTimeOffset.UtcNow,
+                count = ticks.Count,
+                items = ticks,
+            });
+        });
+
         grp.MapGet("/overview", async (TickerSnapshotCache tickerCache, CancellationToken ct) =>
         {
             var tickers = await tickerCache.GetAsync(ct);
@@ -244,15 +269,28 @@ public static class MarketEndpoints
             if (whitelist is not null)
                 usdtSymbols = usdtSymbols.Where(whitelist.Contains).ToList();
 
-            // Pre-filter by 24h volume (single weight-80 call) to cap rolling-ticker fanout.
-            // Calling /api/v3/ticker for 1000+ symbols burns 2000+ weight and 429s on Binance.
+            // Pre-filter by 24h volume to cap rolling-ticker fanout — calling /api/v3/ticker cho
+            // 1000+ symbols burn weight + nguy cơ 429.
+            //
+            // Lưu ý semantic: window != "1d" thì minVol bạn nhập áp cho VOLUME CỦA WINDOW đó
+            // (vd 15m vol >= 500K), KHÔNG phải 24h. Nếu pre-stage filter theo 24h vol >= minVol
+            // sẽ loại oan coin có 24h vol thấp nhưng spike trong 15m (vd BABYUSDT, tokens nhỏ
+            // đang pump). Chỉ áp 24h floor khi user thực sự đang query window=1d.
+            //
+            // Cap top-400 (was 200) — Binance rolling ticker batch tối đa 50 symbol/call,
+            // weight 2/symbol → 400 = 8 batches × 100 weight = 800 weight tổng. Limit 6000/min
+            // → vẫn thoải mái.
             var usdtSet = usdtSymbols.ToHashSet(StringComparer.OrdinalIgnoreCase);
             var pre = await tickerCache.GetAsync(ct);
-            var preTop = pre
-                .Where(t => usdtSet.Contains(t.Symbol))
-                .Where(t => t.QuoteVolume >= minVol)
+            var preQuery = pre.Where(t => usdtSet.Contains(t.Symbol));
+            if (window == "1d")
+                preQuery = preQuery.Where(t => t.QuoteVolume >= minVol);
+            else
+                // Vẫn yêu cầu volume > 0 để loại bỏ symbol listed nhưng zero-traded.
+                preQuery = preQuery.Where(t => t.QuoteVolume > 0);
+            var preTop = preQuery
                 .OrderByDescending(t => t.QuoteVolume)
-                .Take(200)
+                .Take(400)
                 .Select(t => t.Symbol)
                 .ToList();
 

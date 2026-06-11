@@ -1,5 +1,5 @@
 import { Link, useLocation } from 'react-router-dom'
-import { LogOut, Wifi, WifiOff, Zap } from 'lucide-react'
+import { ChevronDown, LogOut, Wifi, WifiOff, Zap } from 'lucide-react'
 import { HubConnectionState } from '@microsoft/signalr'
 import { useQuery } from '@tanstack/react-query'
 import { Button } from '@/components/ui/button'
@@ -14,8 +14,18 @@ type TradingStatus = {
   message: string
 }
 
-const links = [
-  { href: '/', label: 'Markets' },
+// Item con `children` → render dropdown thay vì link đơn. Markets là cha của Spot/Alpha
+// (cùng phạm vi "thông tin thị trường" — chỉ khác universe).
+type NavItem = { href: string; label: string; children?: { href: string; label: string; desc?: string }[] }
+const links: NavItem[] = [
+  {
+    href: '/',
+    label: 'Markets',
+    children: [
+      { href: '/', label: 'Spot', desc: 'Top USDT pairs · realtime ticker, walls, VWAP' },
+      { href: '/alpha', label: 'Alpha', desc: 'Binance Alpha tokens đã list Futures' },
+    ],
+  },
   { href: '/strategies', label: 'Strategies' },
   { href: '/bots', label: 'Bots' },
   { href: '/backtest', label: 'Backtest' },
@@ -59,7 +69,45 @@ export function NavBar() {
           </Link>
           <nav className="flex items-center gap-0.5">
             {links.map(l => {
-              const active = pathname === l.href || (l.href !== '/' && pathname.startsWith(l.href))
+              // Cha có children → bật khi pathname khớp BẤT KỲ child route nào (Spot `/` + Alpha `/alpha`).
+              const childActive = l.children?.some(c => c.href === '/' ? pathname === '/' : pathname.startsWith(c.href))
+              const active = childActive || pathname === l.href || (l.href !== '/' && !l.children && pathname.startsWith(l.href))
+              if (l.children) {
+                return (
+                  <div key={l.href} className="group relative">
+                    <button
+                      type="button"
+                      className={`relative flex items-center gap-1 rounded-sm px-3 py-1.5 text-[13px] font-medium transition-colors ${
+                        active ? 'text-primary' : 'text-muted-foreground hover:text-foreground'
+                      }`}
+                    >
+                      {l.label}
+                      <ChevronDown className="h-3 w-3 opacity-70 transition-transform group-hover:rotate-180" />
+                      {active && <span className="absolute -bottom-[15px] left-2 right-2 h-[2px] bg-primary" />}
+                    </button>
+                    {/* Hover dropdown — pt-2 tạo "cầu nối" để chuột không mất focus khi di từ button xuống menu */}
+                    <div className="invisible absolute left-0 top-full z-50 pt-2 opacity-0 transition-opacity group-hover:visible group-hover:opacity-100">
+                      <div className="min-w-[240px] rounded-md border border-border bg-surface shadow-lg">
+                        {l.children.map(c => {
+                          const isActive = c.href === '/' ? pathname === '/' : pathname.startsWith(c.href)
+                          return (
+                            <Link
+                              key={c.href}
+                              to={c.href}
+                              className={`block border-b border-border/30 px-3 py-2 text-[12px] last:border-b-0 hover:bg-background ${
+                                isActive ? 'text-primary' : 'text-foreground'
+                              }`}
+                            >
+                              <div className="font-medium">{c.label}</div>
+                              {c.desc && <div className="text-[10.5px] text-muted-foreground">{c.desc}</div>}
+                            </Link>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                )
+              }
               return (
                 <Link
                   key={l.href}

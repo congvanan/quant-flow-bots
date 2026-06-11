@@ -7,11 +7,13 @@ import StrategiesPage from '@/pages/strategies'
 import BacktestPage from '@/pages/backtest'
 import SettingsPage from '@/pages/settings'
 import SymbolDetailPage from '@/pages/symbol-detail'
+import AlphaPage from '@/pages/alpha'
 
 export default function App() {
   return (
     <Routes>
       <Route path="/" element={<DashboardPage />} />
+      <Route path="/alpha" element={<AlphaPage />} />
       <Route path="/login" element={<LoginPage />} />
       <Route path="/bots" element={<BotsPage />} />
       <Route path="/bots/:id" element={<BotDetailPage />} />

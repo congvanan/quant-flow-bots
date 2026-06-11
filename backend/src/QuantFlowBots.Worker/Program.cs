@@ -52,6 +52,7 @@ builder.Services.AddHostedService<OrderBookWallStreamWorker>();
 // builder.Services.AddHostedService<OrderBookWallScannerWorker>();
 builder.Services.AddHostedService<WhaleAlertWorker>();
 builder.Services.AddHostedService<WallAlertWorker>();
+builder.Services.AddHostedService<AlphaPriceStreamWorker>();
 builder.Services.AddHostedService<BinanceAnnouncementWorker>();
 builder.Services.AddHostedService<SymbolStatusReconcilerWorker>();
 builder.Services.AddHostedService<RiskGateEnforcerWorker>();

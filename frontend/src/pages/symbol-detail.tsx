@@ -1,4 +1,4 @@
-import { Link, useParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { useEffect, useState } from 'react'
 import { ArrowLeft } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -13,6 +13,10 @@ export default function SymbolDetailPage() {
 function SymbolDetailInner() {
   const params = useParams<{ code: string }>()
   const code = (params.code ?? '').toUpperCase()
+  const [search] = useSearchParams()
+  // `?market=futures` cho Alpha tokens — TradingView cần suffix `.P` để load đúng perpetual.
+  const market: 'spot' | 'futures' = search.get('market') === 'futures' ? 'futures' : 'spot'
+  const navigate = useNavigate()
   const { subscribeTicker } = useSignalR()
   const [ticker, setTicker] = useState<{ price: number; pct: number } | null>(null)
 
@@ -28,10 +32,15 @@ function SymbolDetailInner() {
       <header className="border-b border-border bg-surface">
         <div className="container flex min-h-16 items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <Link to="/"><Button variant="ghost" size="sm" className="gap-2"><ArrowLeft className="h-4 w-4" /> Back</Button></Link>
+            {/* navigate(-1) trả về đúng trang trước (Alpha hoặc Spot) thay vì luôn về "/". */}
+            <Button variant="ghost" size="sm" className="gap-2" onClick={() => navigate(-1)}>
+              <ArrowLeft className="h-4 w-4" /> Back
+            </Button>
             <div>
               <h1 className="text-lg font-semibold leading-tight">{code}</h1>
-              <p className="text-sm text-muted-foreground">TradingView Advanced Chart · BINANCE:{code}</p>
+              <p className="text-sm text-muted-foreground">
+                TradingView Advanced Chart · BINANCE:{code}{market === 'futures' ? '.P' : ''}
+              </p>
             </div>
           </div>
           {ticker && (
@@ -47,7 +56,7 @@ function SymbolDetailInner() {
 
       <div className="container py-5">
         <div className="overflow-hidden rounded-md border border-border bg-card">
-          <TradingViewChart symbol={code} interval="60" height={760} />
+          <TradingViewChart symbol={code} market={market} interval="60" height={760} />
         </div>
       </div>
     </main>

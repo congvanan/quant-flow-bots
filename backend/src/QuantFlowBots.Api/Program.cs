@@ -17,6 +17,11 @@ builder.Configuration.AddUserSecrets<Program>(optional: true);
 builder.Services.AddInfrastructure(builder.Configuration);
 builder.Services.AddScoped<JwtTokenService>();
 
+// Warm AlphaMarketService cache trong API process — Worker đã warm cache của riêng nó,
+// nhưng instance Singleton bên API là độc lập. Không có warmer này, user request đầu tiên
+// vào /api/market/alpha phải chờ ~3s build pipeline (sparkline 216 symbols × 24 klines).
+builder.Services.AddHostedService<QuantFlowBots.Infrastructure.Exchanges.Binance.AlphaCacheWarmer>();
+
 builder.Services.AddCors(o => o.AddDefaultPolicy(p =>
 {
     p.AllowAnyHeader()

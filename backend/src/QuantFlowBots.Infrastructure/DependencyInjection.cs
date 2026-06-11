@@ -75,6 +75,16 @@ public static class DependencyInjection
         services.Configure<OrderBookWallOptions>(config.GetSection("OrderBookWalls"));
         services.AddSingleton<ITickStreamBus, InMemoryTickStreamBus>();
         services.AddSingleton<TickerSnapshotCache>();
+        services.AddSingleton<SymbolTierResolver>();
+        services.AddSingleton<KlineCache>();
+        services.AddSingleton<AlphaMarketService>();
+        services.AddSingleton<AlphaPriceCache>();
+        services.AddSingleton<FuturesPriceCache>();
+        services.AddSingleton<IBasisGuard, BasisGuard>();
+        services.AddSingleton<IContextFilterRunner, ContextFilterRunner>();
+        // HttpClient riêng cho Alpha — không gắn BinanceGateHandler vì traffic này không
+        // tính vào weight budget của spot (hit bapi.binance.com + fapi.binance.com).
+        services.AddHttpClient("alpha-public");
         services.AddSingleton<QuantFlowBots.Application.Risk.ISymbolRiskGateStore, QuantFlowBots.Infrastructure.Risk.SymbolRiskGateStore>();
         services.AddSingleton<QuantFlowBots.Application.Risk.SymbolRiskGate>();
         // RiskGateBootstrap moved to AddInfrastructureHostedServices() — Worker-only.
