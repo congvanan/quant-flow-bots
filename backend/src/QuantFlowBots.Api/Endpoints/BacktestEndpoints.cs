@@ -150,6 +150,29 @@ public static class BacktestEndpoints
             }
         });
 
+        grp.MapDelete("/{id:guid}", async (Guid id, QuantFlowBotsDbContext db, ClaimsPrincipal user, CancellationToken ct) =>
+        {
+            var userId = ParseUserId(user);
+            var b = await db.Backtests.FirstOrDefaultAsync(x => x.Id == id && x.UserId == userId, ct);
+            if (b is null) return Results.NotFound();
+            db.Backtests.Remove(b);
+            await db.SaveChangesAsync(ct);
+            return Results.NoContent();
+        });
+
+        // Bulk-delete tất cả backtests status=Failed của user — quick clear khi pollute UI.
+        grp.MapDelete("/failed", async (QuantFlowBotsDbContext db, ClaimsPrincipal user, CancellationToken ct) =>
+        {
+            var userId = ParseUserId(user);
+            var failed = await db.Backtests
+                .Where(b => b.UserId == userId && b.Status == BacktestStatus.Failed)
+                .ToListAsync(ct);
+            if (failed.Count == 0) return Results.Ok(new { deleted = 0 });
+            db.Backtests.RemoveRange(failed);
+            await db.SaveChangesAsync(ct);
+            return Results.Ok(new { deleted = failed.Count });
+        });
+
         return app;
     }
 

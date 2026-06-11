@@ -40,10 +40,13 @@ public sealed class BacktestRunner(
         var trades = new List<TradeResult>();
         var commissionRate = req.CommissionPercent / 100m;
 
+        // Tránh O(N²): trước đây mỗi vòng `candles.Take(i+1).ToList()` copy avg N/2 items →
+        // tổng ~N²/2 copies + N allocations. Với 15K nến (5 tháng 15m) = ~112M item copies → 7-8s.
+        // PrefixList là wrapper read-only — chỉ giữ reference + length, O(1) constant per iteration.
         for (var i = strategy.WarmupBars; i < candles.Count; i++)
         {
             var candle = candles[i];
-            var history = candles.Take(i + 1).ToList();
+            var history = new PrefixList<CandleData>(candles, i + 1);
             var ctx = new BacktestStrategyContext(
                 symbolRow.Code, candle.CloseTime, history,
                 positionQty > 0 ? positionQty : null,
@@ -162,6 +165,24 @@ public sealed class BacktestRunner(
 }
 
 public sealed record TradeResult(DateTimeOffset At, string Action, decimal Price, decimal Quantity, decimal RealizedPnl);
+
+/// <summary>
+/// Read-only prefix view over an IReadOnlyList — exposes chỉ N item đầu mà không copy data.
+/// Dùng trong BacktestRunner để tránh O(N²) khi pass history mỗi nến cho strategy.
+/// Cost: 1 reference + 1 int per iteration thay vì List allocation + N item copy.
+/// </summary>
+internal sealed class PrefixList<T>(IReadOnlyList<T> source, int count) : IReadOnlyList<T>
+{
+    public T this[int index] => index >= 0 && index < count
+        ? source[index]
+        : throw new ArgumentOutOfRangeException(nameof(index));
+    public int Count => count;
+    public System.Collections.Generic.IEnumerator<T> GetEnumerator()
+    {
+        for (var i = 0; i < count; i++) yield return source[i];
+    }
+    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+}
 
 internal sealed class BacktestStrategyContext(
     string symbol,
