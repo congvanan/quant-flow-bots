@@ -31,6 +31,7 @@ public sealed class WallAlertWorker(
     IOrderBookWallBus wallBus,
     IConnectionMultiplexer redis,
     IHttpClientFactory httpClientFactory,
+    SymbolTierResolver tierResolver,
     ILogger<WallAlertWorker> logger) : BackgroundService
 {
     private static readonly TimeSpan UserRefreshInterval = TimeSpan.FromSeconds(30);
@@ -43,6 +44,7 @@ public sealed class WallAlertWorker(
     {
         logger.LogInformation("WallAlertWorker started — listening on IOrderBookWallBus.OnWall.");
         await RefreshUsersAsync(stoppingToken);
+        await tierResolver.EnsureFreshAsync(stoppingToken);
         wallBus.OnWall += HandleWall;
         stoppingToken.Register(() => wallBus.OnWall -= HandleWall);
 
@@ -51,6 +53,8 @@ public sealed class WallAlertWorker(
             try { await Task.Delay(UserRefreshInterval, stoppingToken); }
             catch (OperationCanceledException) { return; }
             await RefreshUsersAsync(stoppingToken);
+            // Tier cache có TTL riêng (2 phút) — gọi thường xuyên nhưng noop nếu chưa hết hạn.
+            await tierResolver.EnsureFreshAsync(stoppingToken);
         }
     }
 
@@ -65,7 +69,9 @@ public sealed class WallAlertWorker(
                 .Where(s => s.WallAlertEnabled && s.WallAlertBotToken != null && s.WallAlertChatId != null)
                 .Select(s => new CachedUser(
                     s.UserId, s.WallAlertBotToken!, s.WallAlertChatId!,
-                    s.WallAlertMinNotional, s.WallAlertMaxDistancePct, s.WallAlertSide,
+                    s.WallAlertMinNotional,
+                    s.WallAlertMinNotionalTop, s.WallAlertMinNotionalMid, s.WallAlertMinNotionalLow,
+                    s.WallAlertMaxDistancePct, s.WallAlertSide,
                     s.WallAlertCooldownMinutes))
                 .ToListAsync(ct);
             _users = users.ToArray();
@@ -100,6 +106,10 @@ public sealed class WallAlertWorker(
     {
         var redisDb = redis.GetDatabase();
 
+        // Phân loại symbol 1 lần / event — dùng chung cho toàn bộ user. Unknown nghĩa là
+        // tier resolver chưa kịp nạp ranking (ví dụ vừa cold-start) → rơi về MinNotional cũ.
+        var tier = tierResolver.GetTier(evt.Symbol);
+
         // Order-book snapshot is rendered lazily: only once, and only if at least one user actually
         // clears the cooldown below (so we never fetch depth / draw when everyone's on cooldown).
         byte[]? photo = null;
@@ -107,7 +117,8 @@ public sealed class WallAlertWorker(
 
         foreach (var u in users)
         {
-            if (evt.QuoteNotional < u.MinNotional) continue;
+            var threshold = ThresholdFor(u, tier);
+            if (evt.QuoteNotional < threshold) continue;
             if (evt.DistanceFromMidPercent > u.MaxDistancePct) continue;
             if (!string.IsNullOrEmpty(u.Side) && !string.Equals(u.Side, evt.Side, StringComparison.OrdinalIgnoreCase)) continue;
 
@@ -123,8 +134,15 @@ public sealed class WallAlertWorker(
 
             var sideEmoji = evt.Side == "Bid" ? "🟢" : "🔴";
             var sideWord = evt.Side == "Bid" ? "BUY" : "SELL";
+            var tierTag = tier switch
+            {
+                SymbolTier.Top => "🥇 Top",
+                SymbolTier.Mid => "🥈 Mid",
+                SymbolTier.Low => "🥉 Low",
+                _ => "❔ Unknown",
+            };
             var text =
-                $"🧱 *{evt.Symbol}* — {sideEmoji} *{sideWord} wall* @ {FmtPrice(evt.Price)} USDT\n" +
+                $"🧱 *{evt.Symbol}* `[{tierTag}]` — {sideEmoji} *{sideWord} wall* @ {FmtPrice(evt.Price)} USDT\n" +
                 $"💰 Notional: *{FmtUsdt(evt.QuoteNotional)}* · {evt.DistanceFromMidPercent:F2}% from mid\n" +
                 $"📊 {evt.Multiplier:F1}× avg level · Quantity: {FmtBig(evt.Quantity)}\n" +
                 $"⏱ {evt.At:HH:mm:ss} UTC";
@@ -199,12 +217,32 @@ public sealed class WallAlertWorker(
         return p.ToString("G6");
     }
 
+    /// <summary>
+    /// Chọn ngưỡng MinNotional theo tier của symbol. Ưu tiên trường tier riêng;
+    /// nếu user chưa cấu hình (= 0) hoặc tier Unknown → fallback về <c>MinNotional</c> cũ
+    /// để không làm gãy user đang dùng setting cũ.
+    /// </summary>
+    private static decimal ThresholdFor(CachedUser u, SymbolTier tier)
+    {
+        var t = tier switch
+        {
+            SymbolTier.Top => u.MinNotionalTop,
+            SymbolTier.Mid => u.MinNotionalMid,
+            SymbolTier.Low => u.MinNotionalLow,
+            _ => 0m,
+        };
+        return t > 0m ? t : u.MinNotional;
+    }
+
     /// <summary>Snapshot of a user's wall-alert settings, cached in-memory (refreshed on a timer).</summary>
     private sealed record CachedUser(
         Guid UserId,
         string BotToken,
         string ChatId,
         decimal MinNotional,
+        decimal MinNotionalTop,
+        decimal MinNotionalMid,
+        decimal MinNotionalLow,
         decimal MaxDistancePct,
         string? Side,
         int CooldownMinutes);

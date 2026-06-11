@@ -31,7 +31,20 @@ public sealed class UserSettings
     public string? WallAlertBotToken { get; set; }
     public string? WallAlertChatId { get; set; }
     public bool WallAlertEnabled { get; set; }
+    /// <summary>
+    /// Deprecated — giữ làm fallback khi 3 trường tier (Top/Mid/Low) đều = 0
+    /// (UI cũ trước khi thêm tier). WallAlertWorker ưu tiên đọc ngưỡng theo tier;
+    /// chỉ rơi về trường này khi tier resolver chưa có dữ liệu cho symbol.
+    /// </summary>
     public decimal WallAlertMinNotional { get; set; } = 500_000m;
+    /// <summary>Ngưỡng cho Top cap (top 20 USDT pair theo 24h volume). Mặc định 1M
+    /// vì coin top hay có wall lớn, cần ngưỡng cao mới đáng để alert.</summary>
+    public decimal WallAlertMinNotionalTop { get; set; } = 1_000_000m;
+    /// <summary>Ngưỡng cho Mid cap (rank 21-100). Mặc định giữ 500k như cũ.</summary>
+    public decimal WallAlertMinNotionalMid { get; set; } = 500_000m;
+    /// <summary>Ngưỡng cho Low cap (rank 101+). Mặc định 300k vì wall 300k ở
+    /// low cap đã là tín hiệu đáng kể.</summary>
+    public decimal WallAlertMinNotionalLow { get; set; } = 300_000m;
     public decimal WallAlertMaxDistancePct { get; set; } = 2m;
     /// <summary>"Bid" | "Ask" | "" (both) — filter side of the wall.</summary>
     public string WallAlertSide { get; set; } = "";

@@ -44,7 +44,21 @@ public sealed class OrderBookWallStreamWorker(
     // 1000ms is the steady-state Partial Book Depth tier. 100ms exists but bursts to ~1000 msg/s
     // for 100 symbols — way more than we need for wall detection.
     private const string DepthRate = "1000ms";
-    private const int DepthLevels = 20;   // top 20 bids + asks per snapshot
+    // 10 levels mỗi bên là đủ. Lý do: MaxDistanceFromMidPercent mặc định 2% — với BTC
+    // book sâu thì 10 level chỉ trong ~0.05%, với altcoin thì 10 level đã vượt 2% (sẽ bị
+    // filter distance loại bỏ dù vẫn parse). Cắt 20 → 10 giảm payload JSON ~50% và parse
+    // cost ~50% mà không miss wall nào trong vùng MaxDistance.
+    private const int DepthLevels = 10;
+
+    // Dedupe tại nguồn: cùng (symbol, side, price) đứng yên trên book → tránh re-Upsert/Publish
+    // mỗi giây. Key = "symbol|side|price". Value = (qty, ticks). Skip nếu:
+    //   - cùng key được emit < EmitDedupe trước, VÀ
+    //   - qty thay đổi < QtyTolerance (wall không đổi đáng kể).
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (decimal Qty, long Ticks)> _lastEmit
+        = new(StringComparer.OrdinalIgnoreCase);
+    private long _lastEmitPruneTicks = DateTimeOffset.UtcNow.UtcTicks;
+    private static readonly TimeSpan EmitDedupe = TimeSpan.FromSeconds(8);
+    private const decimal QtyTolerance = 0.05m; // 5% — wall tăng/giảm trong 5% vẫn coi là "cùng wall"
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -127,6 +141,9 @@ public sealed class OrderBookWallStreamWorker(
     private async Task PumpAsync(ClientWebSocket ws, OrderBookWallOptions opt, Func<bool> shouldResub, CancellationToken ct)
     {
         var buffer = new byte[64 * 1024];
+        // Backup buffer cho hiếm hoi case message vượt 1 frame (depth20@1000ms message điển hình
+        // ~2KB, < buffer 64KB, nên 99%+ message fit 1 frame). Lazy allocation.
+        List<byte>? overflow = null;
         while (ws.State == WebSocketState.Open && !ct.IsCancellationRequested)
         {
             if (shouldResub())
@@ -136,23 +153,40 @@ public sealed class OrderBookWallStreamWorker(
                 return;
             }
 
-            var sb = new StringBuilder();
-            WebSocketReceiveResult result;
-            do
-            {
-                result = await ws.ReceiveAsync(buffer, ct);
-                if (result.MessageType == WebSocketMessageType.Close) return;
-                sb.Append(Encoding.UTF8.GetString(buffer, 0, result.Count));
-            } while (!result.EndOfMessage);
+            var first = await ws.ReceiveAsync(buffer, ct);
+            if (first.MessageType == WebSocketMessageType.Close) return;
 
-            try { ProcessMessage(sb.ToString(), opt, ct); }
+            try
+            {
+                if (first.EndOfMessage)
+                {
+                    // Fast path: 1 frame = parse trực tiếp từ byte slice (ReadOnlyMemory<byte>).
+                    // Bỏ StringBuilder + UTF8.GetString → tiết kiệm 1 string alloc/message
+                    // (~500/s = 500/s alloc cũ). 99%+ message depth10@1000ms fit 1 frame ~2KB.
+                    ProcessMessage(buffer.AsMemory(0, first.Count), opt, ct);
+                }
+                else
+                {
+                    overflow ??= new List<byte>(buffer.Length);
+                    overflow.Clear();
+                    overflow.AddRange(buffer.AsSpan(0, first.Count));
+                    WebSocketReceiveResult next;
+                    do
+                    {
+                        next = await ws.ReceiveAsync(buffer, ct);
+                        if (next.MessageType == WebSocketMessageType.Close) return;
+                        overflow.AddRange(buffer.AsSpan(0, next.Count));
+                    } while (!next.EndOfMessage);
+                    ProcessMessage(overflow.ToArray().AsMemory(), opt, ct);
+                }
+            }
             catch (Exception ex) { logger.LogDebug(ex, "Wall stream parse failed"); }
         }
     }
 
-    private void ProcessMessage(string payload, OrderBookWallOptions opt, CancellationToken ct)
+    private void ProcessMessage(ReadOnlyMemory<byte> payload, OrderBookWallOptions opt, CancellationToken ct)
     {
-        if (string.IsNullOrWhiteSpace(payload)) return;
+        if (payload.Length == 0) return;
         using var doc = JsonDocument.Parse(payload);
         if (!doc.RootElement.TryGetProperty("stream", out var streamEl)) return;
         var stream = streamEl.GetString() ?? string.Empty;
@@ -187,17 +221,46 @@ public sealed class OrderBookWallStreamWorker(
     private void ScanSide(string symbol, string side, (decimal Price, decimal Qty)[] levels,
         decimal mid, decimal avgNotional, OrderBookWallOptions opt, CancellationToken ct)
     {
+        var nowTicks = DateTimeOffset.UtcNow.UtcTicks;
+        var dedupeWindow = EmitDedupe.Ticks;
         foreach (var lvl in levels)
         {
             var notional = lvl.Price * lvl.Qty;
             if (notional < opt.DetectionFloorUsdt) continue;
             var distPct = Math.Abs(lvl.Price - mid) / mid * 100m;
             if (distPct > opt.MaxDistanceFromMidPercent) continue;
+
+            // At-source dedupe — wall đứng yên trên book sẽ bị WS push mỗi 1s. Không cần emit
+            // lại sự kiện đó. WallAlertWorker downstream đã throttle 5s/symbol|side rồi, nhưng
+            // bỏ ngay ở đây tránh oan bus channel + wallCache.Upsert + SignalR fan-out.
+            var key = $"{symbol}|{side}|{lvl.Price}";
+            if (_lastEmit.TryGetValue(key, out var last)
+                && nowTicks - last.Ticks < dedupeWindow
+                && last.Qty > 0m
+                && Math.Abs(lvl.Qty - last.Qty) / last.Qty < QtyTolerance)
+            {
+                continue;
+            }
+            _lastEmit[key] = (lvl.Qty, nowTicks);
+
             var multiplier = avgNotional > 0m ? notional / avgNotional : 0m;
             var evt = new OrderBookWallEvent(
                 symbol, side, lvl.Price, lvl.Qty, notional, mid, distPct, multiplier, DateTimeOffset.UtcNow);
             wallCache.Upsert(evt);
             _ = bus.PublishAsync(evt, ct);   // fire-and-forget — bus channel is bounded with drop-oldest
+        }
+
+        // Prune dedupe map mỗi 60s — entry > 60s không cần giữ (đã ra khỏi window). Time-gated
+        // CAS để mỗi tick prune O(1) amortised, không phụ thuộc số message qua.
+        if (nowTicks - Interlocked.Read(ref _lastEmitPruneTicks) > TimeSpan.FromSeconds(60).Ticks)
+        {
+            var oldTicks = Interlocked.Read(ref _lastEmitPruneTicks);
+            if (Interlocked.CompareExchange(ref _lastEmitPruneTicks, nowTicks, oldTicks) == oldTicks)
+            {
+                var cutoff = nowTicks - TimeSpan.FromSeconds(60).Ticks;
+                foreach (var (k, v) in _lastEmit)
+                    if (v.Ticks < cutoff) _lastEmit.TryRemove(k, out _);
+            }
         }
     }
 

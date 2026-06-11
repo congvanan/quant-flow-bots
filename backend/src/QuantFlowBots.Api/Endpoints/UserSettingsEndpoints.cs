@@ -25,6 +25,9 @@ public static class UserSettingsEndpoints
         bool WallAlertBotTokenConfigured,
         string? WallAlertChatId,
         decimal WallAlertMinNotional,
+        decimal WallAlertMinNotionalTop,
+        decimal WallAlertMinNotionalMid,
+        decimal WallAlertMinNotionalLow,
         decimal WallAlertMaxDistancePct,
         string WallAlertSide,
         int WallAlertCooldownMinutes,
@@ -48,6 +51,9 @@ public static class UserSettingsEndpoints
         string? WallAlertBotToken,
         string? WallAlertChatId,
         decimal? WallAlertMinNotional,
+        decimal? WallAlertMinNotionalTop,
+        decimal? WallAlertMinNotionalMid,
+        decimal? WallAlertMinNotionalLow,
         decimal? WallAlertMaxDistancePct,
         string? WallAlertSide,
         int? WallAlertCooldownMinutes);
@@ -85,12 +91,15 @@ public static class UserSettingsEndpoints
             if (req.WhaleAlertMode is not null && (req.WhaleAlertMode is "intrabar" or "candle_close")) s.WhaleAlertMode = req.WhaleAlertMode;
             if (req.WhaleAlertCooldownMinutes.HasValue) s.WhaleAlertCooldownMinutes = Math.Clamp(req.WhaleAlertCooldownMinutes.Value, 5, 1440);
             if (req.WhaleAlertDirection is not null && (req.WhaleAlertDirection is "buy" or "sell" or "both")) s.WhaleAlertDirection = req.WhaleAlertDirection;
-            if (req.WhaleAlertLookback.HasValue) s.WhaleAlertLookback = Math.Clamp(req.WhaleAlertLookback.Value, 5, 50);
+            if (req.WhaleAlertLookback.HasValue) s.WhaleAlertLookback = Math.Clamp(req.WhaleAlertLookback.Value, 5, 200);
 
             if (req.WallAlertEnabled.HasValue) s.WallAlertEnabled = req.WallAlertEnabled.Value;
             if (req.WallAlertBotToken is not null) s.WallAlertBotToken = string.IsNullOrWhiteSpace(req.WallAlertBotToken) ? null : req.WallAlertBotToken.Trim();
             if (req.WallAlertChatId is not null) s.WallAlertChatId = string.IsNullOrWhiteSpace(req.WallAlertChatId) ? null : req.WallAlertChatId.Trim();
             if (req.WallAlertMinNotional.HasValue) s.WallAlertMinNotional = Math.Max(0m, req.WallAlertMinNotional.Value);
+            if (req.WallAlertMinNotionalTop.HasValue) s.WallAlertMinNotionalTop = Math.Max(0m, req.WallAlertMinNotionalTop.Value);
+            if (req.WallAlertMinNotionalMid.HasValue) s.WallAlertMinNotionalMid = Math.Max(0m, req.WallAlertMinNotionalMid.Value);
+            if (req.WallAlertMinNotionalLow.HasValue) s.WallAlertMinNotionalLow = Math.Max(0m, req.WallAlertMinNotionalLow.Value);
             if (req.WallAlertMaxDistancePct.HasValue) s.WallAlertMaxDistancePct = Math.Clamp(req.WallAlertMaxDistancePct.Value, 0m, 20m);
             if (req.WallAlertSide is not null && (req.WallAlertSide is "" or "Bid" or "Ask")) s.WallAlertSide = req.WallAlertSide;
             if (req.WallAlertCooldownMinutes.HasValue) s.WallAlertCooldownMinutes = Math.Clamp(req.WallAlertCooldownMinutes.Value, 1, 1440);
@@ -154,7 +163,7 @@ public static class UserSettingsEndpoints
             if (!Enum.TryParse<QuantFlowBots.Domain.Enums.CandleInterval>(ivEnumName, true, out var iv))
                 iv = QuantFlowBots.Domain.Enums.CandleInterval.FifteenMinutes;
 
-            var lookback = Math.Clamp(s.WhaleAlertLookback, 5, 50);
+            var lookback = Math.Clamp(s.WhaleAlertLookback, 5, 200);
             var candles = await binance.GetCandlesAsync(sym, iv, null, null, lookback + 1, ct);
             if (candles.Count < 3) return Results.BadRequest(new { error = $"Not enough klines for {sym}" });
             var curr = candles[^1];
@@ -253,7 +262,7 @@ public static class UserSettingsEndpoints
 
     private static UserSettingsDto ToDto(UserSettings? s) => s is null
         ? new UserSettingsDto(false, false, null, false, false, null, null, 5m, 500_000m, "candle_close", 60, "both", 20,
-            false, false, null, 500_000m, 2m, "", 30, DateTimeOffset.MinValue)
+            false, false, null, 500_000m, 1_000_000m, 500_000m, 300_000m, 2m, "", 30, DateTimeOffset.MinValue)
         : new UserSettingsDto(
             s.TelegramAlertsEnabled, !string.IsNullOrWhiteSpace(s.TelegramBotToken), s.TelegramChatId,
             s.WhaleAlertEnabled, !string.IsNullOrWhiteSpace(s.WhaleAlertBotToken), s.WhaleAlertChatId,
@@ -261,7 +270,9 @@ public static class UserSettingsEndpoints
             s.WhaleAlertMode ?? "candle_close", s.WhaleAlertCooldownMinutes, s.WhaleAlertDirection ?? "both",
             s.WhaleAlertLookback,
             s.WallAlertEnabled, !string.IsNullOrWhiteSpace(s.WallAlertBotToken), s.WallAlertChatId,
-            s.WallAlertMinNotional, s.WallAlertMaxDistancePct, s.WallAlertSide ?? "", s.WallAlertCooldownMinutes,
+            s.WallAlertMinNotional,
+            s.WallAlertMinNotionalTop, s.WallAlertMinNotionalMid, s.WallAlertMinNotionalLow,
+            s.WallAlertMaxDistancePct, s.WallAlertSide ?? "", s.WallAlertCooldownMinutes,
             s.UpdatedAt);
 
     private static Guid ParseUserId(ClaimsPrincipal user)

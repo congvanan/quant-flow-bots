@@ -490,10 +490,10 @@ function WhaleAlertTabBody({ settings }: { settings: UserSettingsDto | undefined
               </Field>
               <Field label="Lookback (candles)">
                 <input
-                  type="number" min={5} max={50}
+                  type="number" min={5} max={200}
                   className="h-9 w-full rounded-sm border border-border bg-surface px-3 font-mono text-sm"
                   value={lookback} onChange={e => setLookback(e.target.value)}
-                  title="Number of previous candles averaged as baseline. Current candle volume is compared to this average."
+                  title="Số nến quá khứ làm baseline. 20-50 cho phản ứng nhanh, 100-200 cho avg ổn định dài hạn. Tối đa 200."
                 />
               </Field>
               <Field label="Min 24h vol (USDT)">
@@ -566,7 +566,9 @@ function WallAlertTabBody({ settings }: { settings: UserSettingsDto | undefined 
   const [token, setToken] = useState('')
   const [chatId, setChatId] = useState('')
   const [enabled, setEnabled] = useState(false)
-  const [minNotional, setMinNotional] = useState('500000')
+  const [minNotionalTop, setMinNotionalTop] = useState('1000000')
+  const [minNotionalMid, setMinNotionalMid] = useState('500000')
+  const [minNotionalLow, setMinNotionalLow] = useState('300000')
   const [maxDistancePct, setMaxDistancePct] = useState('2')
   const [side, setSide] = useState<'' | 'Bid' | 'Ask'>('')
   const [cooldown, setCooldown] = useState('30')
@@ -576,7 +578,9 @@ function WallAlertTabBody({ settings }: { settings: UserSettingsDto | undefined 
     if (!settings) return
     setEnabled(settings.wallAlertEnabled)
     setChatId(settings.wallAlertChatId ?? '')
-    setMinNotional(String(settings.wallAlertMinNotional ?? 500000))
+    setMinNotionalTop(String(settings.wallAlertMinNotionalTop ?? 1000000))
+    setMinNotionalMid(String(settings.wallAlertMinNotionalMid ?? 500000))
+    setMinNotionalLow(String(settings.wallAlertMinNotionalLow ?? 300000))
     setMaxDistancePct(String(settings.wallAlertMaxDistancePct ?? 2))
     setSide(settings.wallAlertSide ?? '')
     setCooldown(String(settings.wallAlertCooldownMinutes ?? 30))
@@ -601,7 +605,9 @@ function WallAlertTabBody({ settings }: { settings: UserSettingsDto | undefined 
     const body: Record<string, unknown> = {
       wallAlertEnabled: enabled,
       wallAlertChatId: chatId.trim(),
-      wallAlertMinNotional: Number(minNotional),
+      wallAlertMinNotionalTop: Number(minNotionalTop),
+      wallAlertMinNotionalMid: Number(minNotionalMid),
+      wallAlertMinNotionalLow: Number(minNotionalLow),
       wallAlertMaxDistancePct: Number(maxDistancePct),
       wallAlertSide: side,
       wallAlertCooldownMinutes: Number(cooldown),
@@ -617,9 +623,17 @@ function WallAlertTabBody({ settings }: { settings: UserSettingsDto | undefined 
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-1.5 text-[10px]">
         <span className="uppercase tracking-wider text-muted-foreground">Trigger:</span>
-        <EventChip>🧱 single price level ≥ MinNotional</EventChip>
+        <EventChip>🧱 single price level ≥ MinNotional theo tier</EventChip>
         <EventChip>📏 within MaxDistance % of mid</EventChip>
         <EventChip>🤖 separate Telegram bot</EventChip>
+      </div>
+      <div className="rounded-sm border border-border/40 bg-surface/60 px-2.5 py-2 text-[11px] text-muted-foreground">
+        <p>
+          <span className="text-foreground">Phân loại tier theo 24h volume:</span>{' '}
+          <span className="text-up">Top</span> = rank 1-20 ·
+          <span className="text-warning"> Mid</span> = 21-100 ·
+          <span> Low</span> = 101+. Tự cập nhật mỗi 2 phút.
+        </p>
       </div>
       <form onSubmit={save} className="grid gap-3 md:grid-cols-[1fr_240px]">
         <div className="space-y-3">
@@ -644,14 +658,34 @@ function WallAlertTabBody({ settings }: { settings: UserSettingsDto | undefined 
             </Field>
           </div>
 
-          <div className="grid gap-3 md:grid-cols-4">
-            <Field label="Min notional (USDT)">
+          <div className="grid gap-3 md:grid-cols-3">
+            <Field label="Min notional — 🥇 Top cap (USDT)">
               <input
                 type="number" min={0} step={100000}
                 className="h-9 w-full rounded-sm border border-border bg-surface px-3 font-mono text-sm"
-                value={minNotional} onChange={e => setMinNotional(e.target.value)}
+                value={minNotionalTop} onChange={e => setMinNotionalTop(e.target.value)}
+                title="Ngưỡng cho top 20 coin theo 24h volume (BTC/ETH/BNB/SOL…). Đặt cao để bớt spam."
               />
             </Field>
+            <Field label="Min notional — 🥈 Mid cap (USDT)">
+              <input
+                type="number" min={0} step={50000}
+                className="h-9 w-full rounded-sm border border-border bg-surface px-3 font-mono text-sm"
+                value={minNotionalMid} onChange={e => setMinNotionalMid(e.target.value)}
+                title="Rank 21-100. 500k là baseline tốt."
+              />
+            </Field>
+            <Field label="Min notional — 🥉 Low cap (USDT)">
+              <input
+                type="number" min={0} step={50000}
+                className="h-9 w-full rounded-sm border border-border bg-surface px-3 font-mono text-sm"
+                value={minNotionalLow} onChange={e => setMinNotionalLow(e.target.value)}
+                title="Rank 101+. Wall 300k ở low cap đã rất đáng chú ý."
+              />
+            </Field>
+          </div>
+
+          <div className="grid gap-3 md:grid-cols-3">
             <Field label="Max distance % from mid">
               <input
                 type="number" min={0} max={20} step={0.1}
@@ -698,7 +732,10 @@ function WallAlertTabBody({ settings }: { settings: UserSettingsDto | undefined 
           <div className="rounded-sm border border-border/40 bg-surface px-2.5 py-2 text-[11px] text-muted-foreground">
             <p>Status: {settings?.wallAlertBotTokenConfigured ? <span className="text-up">Token configured</span> : <span className="text-warning">No token</span>}</p>
             <p>Alerts: {settings?.wallAlertEnabled ? <span className="text-up">On</span> : <span>Off</span>}</p>
-            <p>Filter: ≥ ${Number(minNotional).toLocaleString()} · |Δ| ≤ {maxDistancePct}% · {side || 'both'}</p>
+            <p>Top: ≥ ${Number(minNotionalTop).toLocaleString()}</p>
+            <p>Mid: ≥ ${Number(minNotionalMid).toLocaleString()}</p>
+            <p>Low: ≥ ${Number(minNotionalLow).toLocaleString()}</p>
+            <p>|Δ| ≤ {maxDistancePct}% · {side || 'both'}</p>
           </div>
         </div>
       </form>

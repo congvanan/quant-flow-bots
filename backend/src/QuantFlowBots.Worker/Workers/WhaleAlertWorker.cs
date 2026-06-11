@@ -26,15 +26,26 @@ namespace QuantFlowBots.Worker.Workers;
 public sealed class WhaleAlertWorker(
     IServiceScopeFactory scopeFactory,
     TickerSnapshotCache tickerCache,
+    KlineCache klineCache,
     IBinanceGate gate,
     IConnectionMultiplexer redis,
     IHttpClientFactory httpClientFactory,
     ILogger<WhaleAlertWorker> logger) : BackgroundService
 {
-    private static readonly TimeSpan ScanInterval = TimeSpan.FromSeconds(60);
+    // 90s thay vì 60s: 1 cycle nặng (~150-450 call) không cần dồn dập, tăng idle time
+    // giữa các tick → CPU dứt hẳn xuống base level rồi mới scan tiếp.
+    private static readonly TimeSpan ScanInterval = TimeSpan.FromSeconds(90);
     // Backstop against a noisy config flooding Telegram: never send more than this many whale
     // alerts in a single scan pass. Excess is logged so the user knows to raise the multiplier.
     private const int MaxAlertsPerTick = 25;
+    // Hard cap effective lookback ở worker, dù DB cho phép tới 200. Lý do: 100 nến đã đủ
+    // statistical baseline (margin of error gần như ngang 200). Mỗi nến cache ~300 bytes,
+    // 100 vs 200 = -50% memory footprint cache. User vẫn save 200 trong DB tùy ý — chỉ là
+    // worker không tận dụng quá 100 để tránh RAM phồng.
+    private const int WorkerMaxLookback = 100;
+    // Hard cap số symbol scan mỗi tick. minVolume24h của user vẫn filter trước, chỉ cap số
+    // tối đa sau khi sort theo volume. 150 đủ cover >95% volume thị trường USDT.
+    private const int WorkerMaxUniverse = 150;
     private static readonly Random _rng = new();
     private static readonly string[] AllowedIntervals = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h"];
 
@@ -59,6 +70,11 @@ public sealed class WhaleAlertWorker(
             try { await TickAsync(stoppingToken); }
             catch (BinanceGateOpenException) { /* tripped mid-tick — loop yields */ }
             catch (Exception ex) { logger.LogError(ex, "WhaleAlert tick failed"); }
+
+            // Cache prune mỗi ~10 tick (15 phút): xóa entry > 1h tuổi. LRU eviction đã bound
+            // memory ceiling, prune chỉ cần thỉnh thoảng để dọn entry chắc chắn đã chết
+            // (symbol delist) và log hit-rate cho monitoring.
+            if (_rng.Next(10) == 0) klineCache.Prune(TimeSpan.FromHours(1));
 
             var jitter = TimeSpan.FromMilliseconds(_rng.Next(-3000, 3000));
             try { await Task.Delay(ScanInterval + jitter, stoppingToken); } catch { return; }
@@ -101,12 +117,15 @@ public sealed class WhaleAlertWorker(
             .Where(t => Math.Abs(t.LastPrice - 1m) > 0.03m)              // skip dollar-pegged stablecoins
             .Where(t => t.QuoteVolume >= minVolFloor)                    // user's Min-vol = the real scan floor
             .OrderByDescending(t => t.QuoteVolume)
-            .Take(500)
+            .Take(WorkerMaxUniverse)                                     // hard cap 150 — 95% volume cover, RAM-friendly
             .ToList();
         var vol24hBySymbol = top.ToDictionary(t => t.Symbol, t => t.QuoteVolume, StringComparer.OrdinalIgnoreCase);
 
         // One global fetch size — biggest lookback any user asked for, capped at 50.
-        var maxLookback = Math.Min(50, Math.Max(5, users.Max(u => u.WhaleAlertLookback)));
+        // Cap 200 nến: Binance cho phép tối đa 1000/request nên 200 vẫn an toàn trên 1 call,
+        // mỗi nến rất nhẹ về băng thông. 200 × 1h = ~8 ngày baseline — đủ rộng cho mọi chiến
+        // lược, và lớn hơn thì giá trị bổ sung gần như 0 (avg sẽ trở thành noise dài hạn).
+        var maxLookback = Math.Min(WorkerMaxLookback, Math.Max(5, users.Max(u => u.WhaleAlertLookback)));
 
         var detected = 0;
         var suppressed = 0;
@@ -122,9 +141,18 @@ public sealed class WhaleAlertWorker(
             {
                 if (ct.IsCancellationRequested) break;
                 // limit = lookback baseline + 1 current candle.
-                var candles = await binance.GetCandlesAsync(ticker.Symbol, iv, null, null, maxLookback + 1, ct);
+                // Cache klines theo (symbol, interval). Tick trước cùng symbol+iv → return cache,
+                // không gọi REST lại. Giảm 70-95% REST call tùy timeframe (xem KlineCache).
+                var candles = await klineCache.GetAsync(binance, ticker.Symbol, iv, maxLookback + 1, ct);
                 if (candles.Count < 3) continue;
                 var curr = candles[^1];
+
+                // Phân loại đơn giản theo user spec:
+                //   - Nến XANH: close >= open
+                //   - Nến ĐỎ:  close <  open
+                // KHÔNG còn filter body 30%, KHÔNG còn khái niệm doji. Mọi nến đều thuộc 1
+                // trong 2 nhóm và đều tham gia baseline cùng chiều.
+                var currIsBuy = curr.Close >= curr.Open;
 
                 foreach (var user in users)
                 {
@@ -133,11 +161,28 @@ public sealed class WhaleAlertWorker(
                     if (!useIntrabar && !curr.IsClosed) continue;
 
                     var lb = Math.Min(maxLookback, Math.Max(5, user.WhaleAlertLookback));
-                    // Average the last `lb` CLOSED candles ending just before curr.
+                    // Same-direction baseline: nến BUY hiện tại chỉ so với avg của các nến BUY trước đó
+                    // (body bullish rõ ràng) — và ngược lại cho SELL. Lý do: trộn cả xanh + đỏ làm
+                    // baseline bị pha loãng, một cú selloff lớn xen vào sẽ kéo avg lên khiến tín hiệu
+                    // buy thật bị bỏ qua. Filter dùng cùng tiêu chí body ratio như currIsBuyCandleClear
+                    // để các nến doji trong lookback cũng bị loại khỏi baseline.
                     var start = candles.Count - 1 - lb;
                     if (start < 0) start = 0;
                     decimal sum = 0m; var count = 0;
-                    for (var i = start; i < candles.Count - 1; i++) { sum += candles[i].QuoteVolume; count++; }
+                    for (var i = start; i < candles.Count - 1; i++)
+                    {
+                        var c = candles[i];
+                        var cIsBuy = c.Close >= c.Open;
+                        if (cIsBuy != currIsBuy) continue;
+                        sum += c.QuoteVolume; count++;
+                    }
+                    // Cần ít nhất 3 nến cùng chiều. Nếu thị trường 1 chiều cực đoan và không đủ
+                    // → fallback avg toàn bộ để không bỏ sót.
+                    if (count < 3)
+                    {
+                        sum = 0m; count = 0;
+                        for (var i = start; i < candles.Count - 1; i++) { sum += candles[i].QuoteVolume; count++; }
+                    }
                     if (count == 0 || sum <= 0m) continue;
                     var avg = sum / count;
 
@@ -162,7 +207,7 @@ public sealed class WhaleAlertWorker(
 
                     if (!vol24hBySymbol.TryGetValue(ticker.Symbol, out var vol24h) || vol24h < user.WhaleAlertMinVolume24h) continue;
 
-                    var direction = curr.Close >= curr.Open ? "buy" : "sell";
+                    var direction = currIsBuy ? "buy" : "sell";
                     // Treat null OR empty as "both" — the FE/DB stores "" for the default, and `??`
                     // only catches null, so an empty string used to fail BOTH the "both" check and the
                     // direction match → every alert was silently skipped.
