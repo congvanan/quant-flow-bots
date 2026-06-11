@@ -39,11 +39,16 @@ public sealed class SymbolStatusReconcilerWorker(
         }
     }
 
+    // Flag cũ hơn ngưỡng + symbol không còn position mở → safe để clear khỏi UI.
+    // Lý do: delist đã settle, auto-close position đã chạy từ trước (T+0), giữ flag chỉ làm
+    // pollute UI. Symbol vẫn IsActive=false trong DB — nếu user tự retry thì gate sẽ block lại
+    // khi BinanceAnnouncementWorker thấy lại tin xấu, hoặc khi user link bot tới symbol delist.
+    private static readonly TimeSpan StaleFlagAge = TimeSpan.FromDays(7);
+
     private async Task ReconcileAsync(CancellationToken ct)
     {
         // BinanceRestClient.GetSymbolsAsync filters status==TRADING, so use a raw call here to
         // observe non-trading rows too.
-        var http = (HttpClient?)null;
         // Reuse the typed client's underlying HttpClient via reflection-free path: just call the
         // public method again — it already returns only TRADING symbols. We compare presence/absence.
         var live = await binance.GetSymbolsAsync(ct);
@@ -64,5 +69,43 @@ public sealed class SymbolStatusReconcilerWorker(
             logger.LogWarning("Symbol {Symbol} no longer TRADING on Binance → deactivated + risk-blocked", s.Code);
         }
         if (newlyDelisted > 0) await db.SaveChangesAsync(ct);
+
+        await PurgeStaleRiskFlagsAsync(db, ct);
+    }
+
+    /// <summary>
+    /// Xóa risk flag cũ > <see cref="StaleFlagAge"/> nếu symbol KHÔNG còn open position.
+    /// Logic: delist sau 7 ngày = đã settle hoàn toàn (Binance ngừng giao dịch, auto-close
+    /// position đã chạy ở T+0). Giữ entry chỉ làm UI list dài vô tận. Không phá durability —
+    /// nếu sau này có tin xấu mới, BinanceAnnouncementWorker sẽ re-block ngay.
+    /// </summary>
+    private async Task PurgeStaleRiskFlagsAsync(QuantFlowBotsDbContext db, CancellationToken ct)
+    {
+        var cutoff = DateTimeOffset.UtcNow - StaleFlagAge;
+        var oldFlags = await db.SymbolRiskFlags
+            .Where(f => f.At < cutoff)
+            .Select(f => new { f.Id, f.Symbol })
+            .ToListAsync(ct);
+        if (oldFlags.Count == 0) return;
+
+        // Position mở per symbol — tránh purge flag mà bot vẫn còn lệnh chưa close (edge case
+        // nếu auto-close fail). Lookup theo symbol code qua FK.
+        var symbolsWithOpen = await db.Positions
+            .Where(p => p.Status == Domain.Enums.PositionStatus.Open)
+            .Select(p => p.Symbol!.Code)
+            .Distinct()
+            .ToListAsync(ct);
+        var openSet = symbolsWithOpen.ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        var purged = 0;
+        foreach (var f in oldFlags)
+        {
+            if (openSet.Contains(f.Symbol)) continue;
+            // Xóa qua riskGate.UnblockAsync — vừa xóa DB row vừa update in-memory dict.
+            if (await riskGate.UnblockAsync(f.Symbol, ct)) purged++;
+        }
+        if (purged > 0)
+            logger.LogInformation("PurgeStaleRiskFlags: cleared {Count} flags older than {Days}d (no open positions)",
+                purged, StaleFlagAge.TotalDays);
     }
 }

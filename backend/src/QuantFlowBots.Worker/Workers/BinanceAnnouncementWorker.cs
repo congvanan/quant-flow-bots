@@ -68,6 +68,7 @@ public sealed partial class BinanceAnnouncementWorker(
     }
 
     private DateTimeOffset _lastSeenAt = DateTimeOffset.MinValue;
+    private bool _purgedThisRun;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -101,6 +102,14 @@ public sealed partial class BinanceAnnouncementWorker(
 
         using var scope = scopeFactory.CreateScope();
         var db = scope.ServiceProvider.GetRequiredService<QuantFlowBotsDbContext>();
+
+        // One-time guard: purge dupes hiện hữu (Worker từng re-process khi restart vì _lastSeenAt
+        // chỉ in-memory). Idempotent + chạy 1 lần đầu poll mỗi worker run → cost rẻ.
+        if (!_purgedThisRun)
+        {
+            await PurgeDuplicateSentimentAsync(db, ct);
+            _purgedThisRun = true;
+        }
         var scorer = scope.ServiceProvider.GetRequiredService<ISentimentScorer>();
         var agg = scope.ServiceProvider.GetRequiredService<ISentimentAggregator>();
         var bus = scope.ServiceProvider.GetRequiredService<ISentimentBus>();
@@ -129,8 +138,22 @@ public sealed partial class BinanceAnnouncementWorker(
             var targets = matchedSymbols;
             foreach (var symbol in targets)
             {
+                // Dedup: nếu (Source, Url, SymbolCode) đã có row → skip insert mà vẫn cập nhật
+                // EWMA + bus (để aggregator không bỏ sót khi process pull lại). Cost 1 query/symbol;
+                // 2-min poll cadence + ~4 symbols/message → không đáng kể.
+                var existed = !string.IsNullOrEmpty(msg.Url) && await db.SentimentEvents
+                    .AnyAsync(e => e.Source == Source && e.Url == msg.Url && e.SymbolCode == symbol, ct);
+
                 var scored = scorer.Score(new SentimentInput(symbol, Source, msg.Text, msg.Url, msg.At, Tags: "binance"));
                 agg.Apply(scored);
+                if (existed)
+                {
+                    // Skip insert nhưng vẫn process risk gate (idempotent — BlockAsync sẽ no-op nếu
+                    // đã block) để khôi phục state đúng khi Worker restart sau crash dài.
+                    if (isRedFlag && symbol != "MARKET")
+                        await riskGate.BlockAsync(symbol, RedFlagReason(msg.Text), Source, msg.Url, ct);
+                    continue;
+                }
                 var symbolId = symbol == "MARKET" ? (int?)null
                     : await db.Symbols.Where(s => s.Code == symbol).Select(s => (int?)s.Id).FirstOrDefaultAsync(ct);
                 db.SentimentEvents.Add(new SentimentEvent
@@ -159,6 +182,35 @@ public sealed partial class BinanceAnnouncementWorker(
         }
         await db.SaveChangesAsync(ct);
         _lastSeenAt = maxSeenAt;
+    }
+
+    /// <summary>
+    /// Xóa bản sao SentimentEvent từ cùng 1 announcement Binance (cùng Source+Url+SymbolCode)
+    /// còn lại 1 row (oldest = IngestedAt sớm nhất). Lý do: Worker restart reset _lastSeenAt
+    /// → re-process cùng message nhiều lần → mỗi lần insert N rows trùng. FE group-by-url
+    /// hiển thị badge trùng cho user.
+    ///
+    /// Raw SQL vì EF Core LINQ không express NOT IN với multi-column key gọn được; cost ~1ms
+    /// trên ~hundreds rows. Chạy 1 lần đầu poll mỗi worker run (idempotent).
+    /// </summary>
+    private static async Task PurgeDuplicateSentimentAsync(QuantFlowBotsDbContext db, CancellationToken ct)
+    {
+        // Postgres: ROW_NUMBER window — keep oldest row mỗi (Source, Url, SymbolCode), xóa rest.
+        // (Id là uuid → không dùng MIN(Id) được; chọn keeper theo IngestedAt sớm nhất, tie-break Id.)
+        await db.Database.ExecuteSqlRawAsync(@"
+            DELETE FROM qfb.sentiment_events
+            WHERE ""Id"" IN (
+                SELECT ""Id"" FROM (
+                    SELECT ""Id"",
+                           ROW_NUMBER() OVER (
+                               PARTITION BY ""Source"", ""Url"", ""SymbolCode""
+                               ORDER BY ""IngestedAt"", ""Id""
+                           ) AS rn
+                    FROM qfb.sentiment_events
+                    WHERE ""Source"" = 'binance_announcement' AND ""Url"" IS NOT NULL
+                ) ranked
+                WHERE rn > 1
+            );", ct);
     }
 
     /// <summary>Find any open position on the symbol and market-close it via the dispatcher.</summary>
@@ -215,16 +267,35 @@ public sealed partial class BinanceAnnouncementWorker(
         }
 
         // Pattern B — full coin delist phrasing: "Binance Will Delist X, Y, Z on YYYY-MM-DD".
-        // We only scan for bare tickers in the SLICE of text after the "delist" verb so we don't
-        // accidentally match company names mentioned in the announcement preamble.
+        // Trước đây dùng BareTickerRegex {2,10} → ticker 1 ký tự (vd "D" → DUSDT) bị BỎ QUA.
+        // Sửa: explicit list parse giữa "delist" và terminator ("on", " at ", end), split theo
+        // dấu phẩy/" and ". Mỗi segment trim + uppercase → resolve qua baseAssetToCode.
+        // Cách này vừa bắt được ticker 1 ký tự, vừa tránh false positive từ bare-regex matching
+        // các từ in hoa ngẫu nhiên trong preamble.
         var lower = text.ToLowerInvariant();
-        var idx = lower.IndexOf("delist", StringComparison.Ordinal);
-        if (idx >= 0)
+        var delistIdx = lower.IndexOf("delist", StringComparison.Ordinal);
+        if (delistIdx >= 0)
         {
-            var after = text[idx..];
-            foreach (Match m in BareTickerRegex().Matches(after))
+            // Slice sau "delist " — bỏ qua "delist" + space để khỏi nuốt vào segment đầu.
+            var sliceStart = delistIdx + "delist".Length;
+            // Terminator phổ biến: "on YYYY-MM-DD" (date), "at HH:MM" (time), "from" (action). Cắt tại đó.
+            var slice = text[sliceStart..];
+            var sliceLower = slice.ToLowerInvariant();
+            foreach (var stop in (string[])[" on ", " at ", " from ", "\n", "."])
             {
-                var token = m.Value.ToUpperInvariant();
+                var stopIdx = sliceLower.IndexOf(stop, StringComparison.Ordinal);
+                if (stopIdx > 0) { slice = slice[..stopIdx]; break; }
+            }
+            // Split theo "," và " and " (ASCII boundary an toàn — message Binance dùng tiếng Anh).
+            var segments = slice
+                .Replace(" and ", ",", StringComparison.OrdinalIgnoreCase)
+                .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            foreach (var seg in segments)
+            {
+                // Token = chữ A-Z 1-10 ký tự (tăng từ {2,10}; "D" hợp lệ). Tránh khớp cả câu.
+                var match = SingleTickerRegex().Match(seg);
+                if (!match.Success) continue;
+                var token = match.Value.ToUpperInvariant();
                 if (baseAssetToCode.TryGetValue(token, out var code))
                     found.Add(code);
             }
@@ -254,6 +325,8 @@ public sealed partial class BinanceAnnouncementWorker(
 
     [GeneratedRegex(@"\b(?<base>[A-Z0-9]{2,10})/USDT\b")] private static partial Regex PairUsdtRegex();
     [GeneratedRegex(@"\b[A-Z]{2,10}\b")] private static partial Regex BareTickerRegex();
+    // Match 1 token A-Z trong segment đã split — cho phép 1-10 ký tự (DUSDT cần "D" hợp lệ).
+    [GeneratedRegex(@"^\s*([A-Z]{1,10})\s*$")] private static partial Regex SingleTickerRegex();
     [GeneratedRegex(@"<[^>]+>")] private static partial Regex HtmlTagRegex();
     // Pulls each post: the datetime is on a <time datetime="..."> inside the meta, and the
     // post URL is on <a class="tgme_widget_message_date" href="...">; the body is in
