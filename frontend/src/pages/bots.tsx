@@ -8,7 +8,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { api, ApiError, type ApiKeyDto, type BotDto, type BotKind, type BotRunMode, type BotStatsRowDto, type StrategyDto } from '@/lib/api'
+import { api, ApiError, type ApiKeyDto, type BotDto, type BotKind, type BotRunMode, type BotStatsRowDto, type MarketKind, type StrategyDto } from '@/lib/api'
 import { qk } from '@/lib/queries'
 
 export default function BotsPage() {
@@ -50,14 +50,23 @@ function Inner() {
   const [kindConfigJson, setKindConfigJson] = useState<string>('')
   const [apiKeyId, setApiKeyId] = useState<string>('')
   const [leverage, setLeverage] = useState<string>('1')
+  // Market axis (chốt 2026-06-03): user khai báo Spot/Futures rõ ràng thay vì FE đoán
+  // từ exchangeCode của api key. TriggerMarket v1 force = ExecutionMarket (BE bỏ qua field).
+  const [executionMarket, setExecutionMarket] = useState<MarketKind>('Spot')
+  // Default 0.5% — basis guard áp dụng cho cả futures bot same-market.
+  const [maxBasisPct, setMaxBasisPct] = useState<string>('0.5')
+  // ContextFilters multi-select (Phase 2). Runtime evaluator sẽ wire ở Phase 3 — hiện tại chỉ
+  // lưu choice để bot config rõ ràng "bot này có check filter X không".
+  const [contextFilters, setContextFilters] = useState<string[]>([])
 
   const { data: apiKeys = [] } = useQuery({
     queryKey: qk.apiKeys,
     queryFn: () => api<ApiKeyDto[]>('/api/settings/api-keys'),
   })
+  // Chỉ hiển thị key khớp ExecutionMarket — user không phải nhìn key sai market.
+  const targetExchangeCode = executionMarket === 'Futures' ? 'binance-futures-testnet' : 'binance-spot-testnet'
   const liveKeys = apiKeys.filter(k =>
-    (k.exchangeCode === 'binance-futures-testnet' || k.exchangeCode === 'binance-spot-testnet')
-    && k.mode === 'Live' && k.isActive)
+    k.exchangeCode === targetExchangeCode && k.mode === 'Live' && k.isActive)
   // Advanced SL/TP
   const [slKind, setSlKind] = useState<'FixedPercent' | 'Atr'>('FixedPercent')
   const [atrPeriod, setAtrPeriod] = useState('14')
@@ -81,6 +90,19 @@ function Inner() {
   useEffect(() => {
     setKindConfigJson(defaultKindConfig(kind))
   }, [kind])
+
+  // Toggle Futures→Spot: reset leverage về 1 + drop api key nếu key đang link là futures.
+  // Tránh validate fail ở BE do state cũ còn dính.
+  useEffect(() => {
+    if (executionMarket === 'Spot') setLeverage('1')
+    const selected = apiKeys.find(k => k.id === apiKeyId)
+    if (!selected) return
+    const keyMarket: MarketKind | null =
+      selected.exchangeCode === 'binance-futures-testnet' ? 'Futures'
+      : selected.exchangeCode === 'binance-spot-testnet' ? 'Spot'
+      : null
+    if (keyMarket && keyMarket !== executionMarket) setApiKeyId('')
+  }, [executionMarket, apiKeys, apiKeyId])
 
   const invalidateBots = () => qc.invalidateQueries({ queryKey: qk.bots })
 
@@ -123,6 +145,9 @@ function Inner() {
       kindConfigJson: kindConfigJson.trim() ? kindConfigJson : null,
       apiKeyId: apiKeyId || null,
       leverage: leverage ? Math.max(1, Math.min(125, Number(leverage))) : 1,
+      executionMarket,
+      maxBasisPct: maxBasisPct ? Number(maxBasisPct) : null,
+      contextFiltersJson: contextFilters.length > 0 ? JSON.stringify({ filters: contextFilters }) : null,
       stopLossKind: slKind,
       defaultStopLossPercent: slPct ? Number(slPct) : null,
       atrPeriod: atrPeriod ? Number(atrPeriod) : null,
@@ -307,52 +332,99 @@ function Inner() {
                 <Hint>Live trading chỉ chạy trên Binance Futures TESTNET (không phải tiền thật).</Hint>
               </Field>
 
-              {runMode === 'LiveTrading' && (() => {
-                const selectedKey = liveKeys.find(k => k.id === apiKeyId)
-                const isFutures = selectedKey?.exchangeCode === 'binance-futures-testnet'
-                return (
-                  <>
-                    <Field label="API key (Spot/Futures TESTNET, mode=Live, validated)">
-                      <Select value={apiKeyId} onChange={e => setApiKeyId(e.target.value)} required>
-                        <option value="">— pick a validated key —</option>
-                        {liveKeys.map(k => (
-                          <option key={k.id} value={k.id}>
-                            [{k.exchangeCode === 'binance-spot-testnet' ? 'SPOT' : 'FUT'}] {k.label} · {k.keyPreview} · validated {k.lastValidatedAt ? new Date(k.lastValidatedAt).toLocaleDateString() : 'never'}
-                          </option>
-                        ))}
-                      </Select>
-                      <Hint>Key phải: mode=Live, exchange Spot/Futures testnet, validate trong 7 ngày, KHÔNG có withdraw permission. Thêm/validate ở /settings.</Hint>
+              {/* Market axis — khai báo rõ ràng, KHÔNG suy ngầm từ exchangeCode (xem [[project-quantflow-market-axis]]).
+                  v1 force Trigger=Execution; UI cross-market sẽ unlock sau khi có backtest dataset. */}
+              <Field label="Market">
+                <Select value={executionMarket} onChange={e => setExecutionMarket(e.target.value as MarketKind)}>
+                  <option value="Spot">Spot — không leverage, không funding</option>
+                  <option value="Futures">Futures USDT-M — có leverage, margin, funding</option>
+                </Select>
+                <Hint>Lệnh đặt ở thị trường này. Trigger nến cũng từ thị trường này (v1).</Hint>
+              </Field>
+
+              {executionMarket === 'Futures' && (
+                <Field label={`Max basis guard % (spot vs futures)`}>
+                  <Input type="number" min={0} step={0.05} value={maxBasisPct} onChange={e => setMaxBasisPct(e.target.value)} placeholder="0.5" />
+                  <Hint>Block entry khi |spot − futures| / spot vượt ngưỡng. Default 0.5%. Để trống = disable (không khuyến khích).</Hint>
+                </Field>
+              )}
+
+              <Field label="Context filters (bộ lọc phụ — xác nhận trước khi entry)">
+                <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 rounded-sm border border-border/60 bg-surface/40 p-2">
+                  {CONTEXT_FILTER_OPTIONS.map(opt => {
+                    const checked = contextFilters.includes(opt.value)
+                    return (
+                      <label key={opt.value} className="flex cursor-pointer items-center gap-1.5 text-[11px]">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => setContextFilters(prev =>
+                            prev.includes(opt.value) ? prev.filter(v => v !== opt.value) : [...prev, opt.value]
+                          )}
+                          className="h-3 w-3 rounded border-border"
+                        />
+                        <span>{opt.label}</span>
+                      </label>
+                    )
+                  })}
+                </div>
+                <Hint>Tất cả filter đã chọn phải PASS để entry — logic AND. Phase 3 sẽ wire runtime evaluator (hiện tại lưu để bot config minh bạch).</Hint>
+              </Field>
+
+              {runMode === 'LiveTrading' && (
+                <>
+                  <Field label={`API key (${executionMarket === 'Futures' ? 'Futures' : 'Spot'} TESTNET, mode=Live, validated)`}>
+                    <Select value={apiKeyId} onChange={e => setApiKeyId(e.target.value)} required>
+                      <option value="">— pick a validated key —</option>
+                      {liveKeys.map(k => (
+                        <option key={k.id} value={k.id}>
+                          [{k.exchangeCode === 'binance-spot-testnet' ? 'SPOT' : 'FUT'}] {k.label} · {k.keyPreview} · validated {k.lastValidatedAt ? new Date(k.lastValidatedAt).toLocaleDateString() : 'never'}
+                        </option>
+                      ))}
+                    </Select>
+                    <Hint>Key phải khớp Market đã chọn ở trên. Mode=Live, validate trong 7 ngày, KHÔNG có withdraw permission. Thêm/validate ở /settings.</Hint>
+                  </Field>
+                  {executionMarket === 'Futures' && (
+                    <Field label="Leverage (1–125)">
+                      <Input type="number" min={1} max={125} step={1} value={leverage} onChange={e => setLeverage(e.target.value)} />
+                      <Hint>Bot tự gọi <code className="font-mono">/fapi/v1/leverage</code> trước lệnh entry.</Hint>
                     </Field>
-                    {isFutures && (
-                      <Field label="Leverage (1–125)">
-                        <Input type="number" min={1} max={125} step={1} value={leverage} onChange={e => setLeverage(e.target.value)} />
-                        <Hint>Bot tự gọi <code className="font-mono">/fapi/v1/leverage</code> trước lệnh entry. Spot bỏ qua field này.</Hint>
-                      </Field>
-                    )}
-                  </>
-                )
-              })()}
+                  )}
+                </>
+              )}
 
               <Divider label="Capital & sizing" />
 
               <div className="grid grid-cols-3 gap-2">
                 <Field label="Equity USDT">
                   <Input type="number" step="1" value={baseEquity} onChange={e => setBaseEquity(e.target.value)} required />
+                  <Hint>Vốn ban đầu bot, baseline để tính PnL %.</Hint>
                 </Field>
                 <Field label="Risk %/trade">
                   <Input type="number" step="0.1" value={riskPct} onChange={e => setRiskPct(e.target.value)} />
+                  <Hint>% equity rủi ro 1 lệnh → tính qty từ SL.</Hint>
                 </Field>
                 <Field label="Max qty cap">
                   <Input type="number" step="0.0001" value={maxQty} onChange={e => setMaxQty(e.target.value)} required />
+                  <Hint>Trần qty cứng — override công thức risk-sizing.</Hint>
                 </Field>
               </div>
 
               <Divider label="Stop loss / Take profit" />
 
               <div className="grid grid-cols-3 gap-2">
-                <Field label="SL % (fixed)"><Input type="number" step="0.1" value={slPct} onChange={e => setSlPct(e.target.value)} /></Field>
-                <Field label="TP % (legacy)"><Input type="number" step="0.1" value={tpPct} onChange={e => setTpPct(e.target.value)} /></Field>
-                <Field label="Trailing %"><Input type="number" step="0.1" placeholder="opt" value={trailingPct} onChange={e => setTrailingPct(e.target.value)} /></Field>
+                <Field label="SL % (fixed)">
+                  <Input type="number" step="0.1" value={slPct} onChange={e => setSlPct(e.target.value)} />
+                  <Hint>% dừng lỗ mặc định khi strategy không tự cung cấp.</Hint>
+                </Field>
+                <Field label="TP % (legacy)">
+                  <Input type="number" step="0.1" value={tpPct} onChange={e => setTpPct(e.target.value)} />
+                  <Hint>TP 1 tier cũ — bỏ qua nếu dùng Multi-TP ở Advanced.</Hint>
+                </Field>
+                <Field label="Trailing %">
+                  <Input type="number" step="0.1" placeholder="opt" value={trailingPct} onChange={e => setTrailingPct(e.target.value)} />
+                  <Hint>Trailing stop %. Trống = không trailing.</Hint>
+                </Field>
               </div>
 
               <button
@@ -442,15 +514,30 @@ function Inner() {
               <Divider label="Risk Engine" />
 
               <div className="grid grid-cols-2 gap-2">
-                <Field label="Daily loss stop %"><Input type="number" step="0.1" value={dailyLoss} onChange={e => setDailyLoss(e.target.value)} /></Field>
-                <Field label="Max open positions"><Input type="number" step="1" value={maxOpen} onChange={e => setMaxOpen(e.target.value)} /></Field>
-                <Field label="Max consec. losses"><Input type="number" step="1" value={maxConsec} onChange={e => setMaxConsec(e.target.value)} /></Field>
-                <Field label="Cooldown (min)"><Input type="number" step="1" value={cooldown} onChange={e => setCooldown(e.target.value)} /></Field>
+                <Field label="Daily loss stop %">
+                  <Input type="number" step="0.1" value={dailyLoss} onChange={e => setDailyLoss(e.target.value)} />
+                  <Hint>Tổng lỗ ngày vượt % này → kill switch trip, bot pause hết ngày.</Hint>
+                </Field>
+                <Field label="Max open positions">
+                  <Input type="number" step="1" value={maxOpen} onChange={e => setMaxOpen(e.target.value)} />
+                  <Hint>Số lệnh được mở đồng thời. 1 = mỗi lần chỉ 1 lệnh.</Hint>
+                </Field>
+                <Field label="Max consec. losses">
+                  <Input type="number" step="1" value={maxConsec} onChange={e => setMaxConsec(e.target.value)} />
+                  <Hint>Thua N lệnh liên tiếp → kill switch trip (0 = tắt).</Hint>
+                </Field>
+                <Field label="Cooldown (min)">
+                  <Input type="number" step="1" value={cooldown} onChange={e => setCooldown(e.target.value)} />
+                  <Hint>Phút chờ sau loss trước khi cho phép entry mới.</Hint>
+                </Field>
               </div>
 
-              <label className="flex items-center gap-2 rounded-sm border border-border bg-surface px-2.5 py-2 text-xs">
-                <input type="checkbox" checked={killEnabled} onChange={e => setKillEnabled(e.target.checked)} className="accent-primary" />
-                <span>Kill switch auto-trip on limit breach</span>
+              <label className="flex items-start gap-2 rounded-sm border border-border bg-surface px-2.5 py-2 text-xs">
+                <input type="checkbox" checked={killEnabled} onChange={e => setKillEnabled(e.target.checked)} className="mt-0.5 accent-primary" />
+                <span>
+                  Kill switch auto-trip on limit breach
+                  <Hint>Khi daily loss hoặc consec losses chạm ngưỡng → tự stop bot, cần reset thủ công.</Hint>
+                </span>
               </label>
 
               {err && <p className="text-xs text-destructive">{err}</p>}
@@ -512,6 +599,17 @@ function runModeShort(rm: BotRunMode): string {
     default: return 'OFF'
   }
 }
+
+// Context filter catalog — đồng bộ với phase 3 runtime evaluator.
+// Value = key dùng trong ContextFiltersJson.filters[]; Label = hiển thị form.
+const CONTEXT_FILTER_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: 'spotTrend',     label: 'Spot trend đồng pha' },
+  { value: 'btcDominance',  label: 'BTC dominance không tăng' },
+  { value: 'whaleAlert',    label: 'Không có whale alert ngược chiều' },
+  { value: 'wallAlert',     label: 'Không có wall lớn chắn entry' },
+  { value: 'sentiment',     label: 'Sentiment không tiêu cực' },
+  { value: 'fundingRate',   label: 'Funding rate trong ngưỡng' },
+]
 
 function defaultKindConfig(kind: BotKind): string {
   switch (kind) {

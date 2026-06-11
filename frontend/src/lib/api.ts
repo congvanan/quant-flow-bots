@@ -45,8 +45,13 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
 
   if (!res.ok) {
+    // BE Endpoints dùng `{ error: "..." }` (singular). Trước đây api.ts chỉ check `errors`
+    // + `message` → fall through ra res.statusText = "Bad Request" generic. Thêm `error`
+    // singular vào hierarchy để FE hiển thị lý do thật.
     const msg = (data && typeof data === 'object' && 'errors' in data)
       ? JSON.stringify((data as { errors: unknown }).errors)
+      : (data && typeof data === 'object' && 'error' in data && typeof (data as { error: unknown }).error === 'string')
+      ? (data as { error: string }).error
       : (data && typeof data === 'object' && 'message' in data && typeof (data as { message: unknown }).message === 'string')
       ? (data as { message: string }).message
       : res.statusText
@@ -109,6 +114,7 @@ export type StrategyDto = {
   parametersJson: string
   description?: string | null
   createdAt: string
+  runningBotCount: number
 }
 
 export type ExchangeDto = {
@@ -137,6 +143,7 @@ export type ApiKeyDto = {
 
 export type BotRunMode = 'Off' | 'ScanOnly' | 'PaperTrading' | 'LiveTrading'
 export type BotKind = 'Signal' | 'Dca' | 'Grid' | 'Scalp'
+export type MarketKind = 'Spot' | 'Futures'
 
 export type BotDto = {
   id: string
@@ -149,6 +156,10 @@ export type BotDto = {
   leverage: number
   runMode: BotRunMode
   symbolFilterJson?: string | null
+  executionMarket: MarketKind
+  triggerMarket: MarketKind
+  contextFiltersJson?: string | null
+  maxBasisPct?: number | null
   strategyId: string
   strategyKind?: string | null
   symbolId: number
@@ -302,6 +313,9 @@ export type UserSettingsDto = {
   wallAlertBotTokenConfigured: boolean
   wallAlertChatId?: string | null
   wallAlertMinNotional: number
+  wallAlertMinNotionalTop: number
+  wallAlertMinNotionalMid: number
+  wallAlertMinNotionalLow: number
   wallAlertMaxDistancePct: number
   wallAlertSide: '' | 'Bid' | 'Ask'
   wallAlertCooldownMinutes: number

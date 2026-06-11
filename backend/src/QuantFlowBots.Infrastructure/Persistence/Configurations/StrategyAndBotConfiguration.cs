@@ -41,6 +41,10 @@ public sealed class BotConfiguration : IEntityTypeConfiguration<Bot>
         e.Property(x => x.RunMode).HasConversion<int>();
         e.Property(x => x.Kind).HasConversion<int>();
         e.Property(x => x.KindConfigJson).HasColumnType("jsonb");
+        e.Property(x => x.ExecutionMarket).HasConversion<int>();
+        e.Property(x => x.TriggerMarket).HasConversion<int>();
+        e.Property(x => x.ContextFiltersJson).HasColumnType("jsonb");
+        e.Property(x => x.MaxBasisPct).HasColumnType("numeric(8,4)");
         e.Property(x => x.KillSwitchReason).HasMaxLength(256);
         e.HasOne(x => x.User).WithMany(u => u.Bots).HasForeignKey(x => x.UserId).OnDelete(DeleteBehavior.Cascade);
         e.HasOne(x => x.Strategy).WithMany().HasForeignKey(x => x.StrategyId).OnDelete(DeleteBehavior.Restrict);

@@ -43,9 +43,15 @@ public static class BotEndpoints
         decimal? DefaultTrailingStopPercent,
         bool? BreakEvenEnabled,
         decimal? BreakEvenTriggerPercent,
-        decimal? BreakEvenOffsetPercent);
+        decimal? BreakEvenOffsetPercent,
+        // Market axis (xem [[project-quantflow-market-axis]]). TriggerMarket bỏ qua ở v1 — API
+        // force = ExecutionMarket. Khi v2 mở cross-market, thêm advanced flag để cho phép lệch.
+        string? ExecutionMarket,
+        string? ContextFiltersJson,
+        decimal? MaxBasisPct);
     public sealed record BotDto(
         Guid Id, string Name, string Mode, string State, string Kind, string? KindConfigJson, Guid? ApiKeyId, int Leverage, string RunMode, string? SymbolFilterJson,
+        string ExecutionMarket, string TriggerMarket, string? ContextFiltersJson, decimal? MaxBasisPct,
         Guid StrategyId, string? StrategyKind,
         int SymbolId, string SymbolCode,
         decimal BaseEquityUsdt, decimal MaxPositionSize, decimal? RiskPerTradePercent,
@@ -79,7 +85,10 @@ public static class BotEndpoints
         decimal? DefaultTrailingStopPercent,
         bool? BreakEvenEnabled,
         decimal? BreakEvenTriggerPercent,
-        decimal? BreakEvenOffsetPercent);
+        decimal? BreakEvenOffsetPercent,
+        string? ExecutionMarket,
+        string? ContextFiltersJson,
+        decimal? MaxBasisPct);
     public sealed record RiskEventDto(
         Guid Id, Guid? BotId, string EventType, string Severity,
         string Message, string? ActionTaken, DateTimeOffset CreatedAt);
@@ -173,6 +182,21 @@ public static class BotEndpoints
             var symbol = await db.Symbols.FirstOrDefaultAsync(s => s.Code == req.SymbolCode.ToUpper(), ct);
             if (symbol is null) return Results.BadRequest(new { error = $"symbol_not_found: {req.SymbolCode}" });
 
+            var executionMarket = ParseMarket(req.ExecutionMarket) ?? MarketKind.Spot;
+            // v1: TriggerMarket = ExecutionMarket (cross-market hidden, scaffold only). Khi v2
+            // mở UI advanced, accept req.TriggerMarket riêng + bắt buộc MaxBasisPct non-null.
+            var triggerMarket = executionMarket;
+
+            // Leverage > 1 chỉ hợp lệ khi ExecutionMarket=Futures. Spot mà set leverage = config sai.
+            var leverage = req.Leverage is int lev ? Math.Clamp(lev, 1, 125) : 1;
+            if (executionMarket == MarketKind.Spot && leverage > 1)
+                return Results.BadRequest(new { error = "leverage_requires_futures", detail = "Set ExecutionMarket=Futures or Leverage=1." });
+
+            // API key phải match ExecutionMarket. Paper trading hoặc unlinked key thì skip check.
+            var resolvedKeyId = await ResolveApiKeyAsync(db, userId, req.ApiKeyId, ct);
+            var apiKeyMarketError = await ValidateApiKeyMarketAsync(db, resolvedKeyId, executionMarket, ct);
+            if (apiKeyMarketError is not null) return Results.BadRequest(new { error = apiKeyMarketError });
+
             var bot = new Bot
             {
                 UserId = userId,
@@ -185,8 +209,12 @@ public static class BotEndpoints
                 RunMode = ParseRunMode(req.RunMode) ?? BotRunMode.PaperTrading,
                 Kind = ParseKind(req.Kind) ?? BotKind.Signal,
                 KindConfigJson = NormalizeJson(req.KindConfigJson),
-                ApiKeyId = await ResolveApiKeyAsync(db, userId, req.ApiKeyId, ct),
-                Leverage = req.Leverage is int lev ? Math.Clamp(lev, 1, 125) : 1,
+                ApiKeyId = resolvedKeyId,
+                Leverage = leverage,
+                ExecutionMarket = executionMarket,
+                TriggerMarket = triggerMarket,
+                ContextFiltersJson = NormalizeJson(req.ContextFiltersJson),
+                MaxBasisPct = req.MaxBasisPct ?? 0.5m,
                 SymbolFilterJson = req.SymbolFilterJson,
                 BaseEquityUsdt = req.BaseEquityUsdt ?? 1000m,
                 MaxPositionSize = req.MaxPositionSize,
@@ -223,9 +251,31 @@ public static class BotEndpoints
             var k = ParseKind(req.Kind);
             if (k.HasValue) bot.Kind = k.Value;
             if (req.KindConfigJson is not null) bot.KindConfigJson = NormalizeJson(req.KindConfigJson);
+            // ExecutionMarket update trước: leverage/api-key validation đều phụ thuộc vào nó.
+            var newExecMarket = ParseMarket(req.ExecutionMarket);
+            if (newExecMarket.HasValue)
+            {
+                bot.ExecutionMarket = newExecMarket.Value;
+                bot.TriggerMarket = newExecMarket.Value; // v1 force Trigger=Execution
+            }
+
             if (req.UnlinkApiKey == true) bot.ApiKeyId = null;
             else if (req.ApiKeyId.HasValue) bot.ApiKeyId = await ResolveApiKeyAsync(db, userId, req.ApiKeyId, ct);
-            if (req.Leverage is int lev) bot.Leverage = Math.Clamp(lev, 1, 125);
+
+            // Re-validate sau khi update market + api key. Cho phép người dùng đổi market hoặc key
+            // đồng thời, nhưng final state phải nhất quán.
+            var apiKeyMarketError = await ValidateApiKeyMarketAsync(db, bot.ApiKeyId, bot.ExecutionMarket, ct);
+            if (apiKeyMarketError is not null) return Results.BadRequest(new { error = apiKeyMarketError });
+
+            if (req.Leverage is int lev)
+            {
+                if (bot.ExecutionMarket == MarketKind.Spot && lev > 1)
+                    return Results.BadRequest(new { error = "leverage_requires_futures" });
+                bot.Leverage = Math.Clamp(lev, 1, 125);
+            }
+            if (req.ContextFiltersJson is not null)
+                bot.ContextFiltersJson = NormalizeJson(req.ContextFiltersJson);
+            if (req.MaxBasisPct.HasValue) bot.MaxBasisPct = req.MaxBasisPct.Value;
             if (req.SymbolFilterJson is not null) bot.SymbolFilterJson = string.IsNullOrWhiteSpace(req.SymbolFilterJson) ? null : req.SymbolFilterJson;
             if (req.BaseEquityUsdt.HasValue) bot.BaseEquityUsdt = req.BaseEquityUsdt.Value;
             if (req.RiskPerTradePercent.HasValue) bot.RiskPerTradePercent = req.RiskPerTradePercent.Value;
@@ -599,6 +649,7 @@ public static class BotEndpoints
 
     private static BotDto ToDto(Bot b, string? strategyKind, string symbolCode)
         => new(b.Id, b.Name, b.Mode.ToString(), b.State.ToString(), b.Kind.ToString(), b.KindConfigJson, b.ApiKeyId, b.Leverage, b.RunMode.ToString(), b.SymbolFilterJson,
+            b.ExecutionMarket.ToString(), b.TriggerMarket.ToString(), b.ContextFiltersJson, b.MaxBasisPct,
             b.StrategyId, strategyKind,
             b.SymbolId, symbolCode,
             b.BaseEquityUsdt, b.MaxPositionSize, b.RiskPerTradePercent,
@@ -608,6 +659,28 @@ public static class BotEndpoints
             b.DefaultTakeProfitPercent, b.TakeProfitLevelsJson, b.DefaultTrailingStopPercent,
             b.BreakEvenEnabled, b.BreakEvenTriggerPercent, b.BreakEvenOffsetPercent,
             b.LastError, b.CreatedAt);
+
+    private static MarketKind? ParseMarket(string? raw)
+        => Enum.TryParse<MarketKind>(raw, true, out var m) ? m : (MarketKind?)null;
+
+    // Bot có ApiKey thì exchange code của key phải khớp ExecutionMarket. Paper trading hoặc
+    // unlinked key: skip (paper executor không cần real key). binance-futures-testnet ⇄ Futures,
+    // binance-spot-testnet ⇄ Spot. Mã exchange khác (vd seed/dev) → bỏ qua (không gắt) để
+    // không khoá scenario thử nghiệm.
+    private static async Task<string?> ValidateApiKeyMarketAsync(QuantFlowBotsDbContext db, Guid? apiKeyId, MarketKind executionMarket, CancellationToken ct)
+    {
+        if (apiKeyId is null) return null;
+        var code = await db.ApiKeys.Where(k => k.Id == apiKeyId.Value)
+            .Select(k => k.Exchange!.Code).FirstOrDefaultAsync(ct);
+        return code switch
+        {
+            "binance-futures-testnet" when executionMarket != MarketKind.Futures
+                => "api_key_market_mismatch: futures key linked but ExecutionMarket=Spot",
+            "binance-spot-testnet" when executionMarket != MarketKind.Spot
+                => "api_key_market_mismatch: spot key linked but ExecutionMarket=Futures",
+            _ => null,
+        };
+    }
 
     private static StopLossKind ParseStopLossKind(string? raw)
         => Enum.TryParse<StopLossKind>(raw, true, out var k) ? k : StopLossKind.FixedPercent;

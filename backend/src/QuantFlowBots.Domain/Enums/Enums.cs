@@ -91,6 +91,15 @@ public enum BotKind
     Scalp = 3
 }
 
+// Trục Market trực giao với BotKind (chốt 2026-06-03). ExecutionMarket = nơi đặt lệnh,
+// TriggerMarket = nguồn nến/giá fire entry. v1 force Trigger=Execution; cross-market
+// (Trigger=Spot, Execution=Futures) sẽ unlock sau khi có backtest dataset.
+public enum MarketKind
+{
+    Spot = 0,
+    Futures = 1
+}
+
 public enum BacktestStatus
 {
     Queued = 0,

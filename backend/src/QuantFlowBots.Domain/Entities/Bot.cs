@@ -19,6 +19,20 @@ public sealed class Bot
     public string? KindConfigJson { get; set; }
     public string? SymbolFilterJson { get; set; }
 
+    // Market axis — chốt 2026-06-03 (xem [[project-quantflow-market-axis]]).
+    // ExecutionMarket quyết định executor + leverage/margin fields. TriggerMarket quyết định
+    // nguồn nến fire entry. v1: API force TriggerMarket = ExecutionMarket; field scaffold sẵn
+    // để v2 enable cross-market với basis guard ràng buộc.
+    public MarketKind ExecutionMarket { get; set; } = MarketKind.Spot;
+    public MarketKind TriggerMarket { get; set; } = MarketKind.Spot;
+    // ContextFilters JSONB: bộ lọc phụ (SpotTrend, BtcDominance, Whale, Wall, Sentiment, FundingRate…).
+    // Schema linh hoạt — thêm filter mới không cần migration.
+    public string? ContextFiltersJson { get; set; }
+    // Basis guard mặc định 0.5%: block entry khi |spot − futures| / spot > MaxBasisPct.
+    // Áp dụng cả khi same-market futures bot (chống wick trap / long-short crowded / funding nóng).
+    // null = disabled.
+    public decimal? MaxBasisPct { get; set; } = 0.5m;
+
     // Capital / sizing
     public decimal BaseEquityUsdt { get; set; } = 1000m;
     public decimal MaxPositionSize { get; set; }
