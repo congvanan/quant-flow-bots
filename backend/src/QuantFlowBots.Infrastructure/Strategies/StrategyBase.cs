@@ -19,6 +19,11 @@ public abstract class StrategyBase : IStrategy
     protected static string? Str(IReadOnlyDictionary<string, object?> p, string key, string? defaultValue)
         => p.TryGetValue(key, out var v) && v is not null ? v.ToString() : defaultValue;
 
+    protected static bool Bool(IReadOnlyDictionary<string, object?> p, string key, bool defaultValue)
+        => p.TryGetValue(key, out var v) && v is not null
+            ? v is bool b ? b : bool.TryParse(v.ToString(), out var parsed) ? parsed : defaultValue
+            : defaultValue;
+
     public static IReadOnlyDictionary<string, object?> ParseJson(string json)
     {
         if (string.IsNullOrWhiteSpace(json) || json == "{}") return new Dictionary<string, object?>();
