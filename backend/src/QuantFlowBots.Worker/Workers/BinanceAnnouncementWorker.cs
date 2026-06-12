@@ -13,14 +13,19 @@ using QuantFlowBots.Infrastructure.Persistence;
 namespace QuantFlowBots.Worker.Workers;
 
 /// <summary>
-/// Pulls https://t.me/s/binance_announcements every 5 min (public preview HTML, no token needed),
-/// extracts new messages since last scan, ingests them as sentiment events (auto-scored by the
-/// existing KeywordSentimentScorer), and — when a message contains red-flag keywords like
-/// "delist", "hack", "suspend trading" — blocks the mentioned symbols in SymbolRiskGate.
+/// Đa nguồn phát hiện delist/hack (poll mỗi 2 phút, fail-independent):
+///   1. https://t.me/s/binance_announcements — Telegram public preview HTML
+///   2. Binance CMS API (bapi catalogId=161 Delisting) — chính nguồn nuôi trang support,
+///      thường publish TRƯỚC telegram vài phút
+/// Messages mới (per-source watermark) được score thành sentiment events (KeywordSentimentScorer),
+/// và khi chứa red-flag keywords ("delist", "hack", "suspend trading"…) → block symbols trong
+/// SymbolRiskGate. Cross-source dedup theo (symbol, ±1 ngày) tránh double-insert khi cùng 1
+/// announcement xuất hiện ở cả 2 nguồn.
 ///
 /// Blocking a symbol additionally triggers an auto-close pass: any open position on that symbol
-/// gets a market sell via TradingDispatcher. User chose this in Đợt I follow-up — delist usually
-/// = liquidity vanishes within hours, so flat-NOW beats getting stuck.
+/// gets a market close (đúng chiều: Long→Sell, Short→Buy) via TradingDispatcher. User chose this
+/// in Đợt I follow-up — delist usually = liquidity vanishes within hours, so flat-NOW beats
+/// getting stuck.
 /// </summary>
 public sealed partial class BinanceAnnouncementWorker(
     IServiceScopeFactory scopeFactory,
@@ -33,6 +38,18 @@ public sealed partial class BinanceAnnouncementWorker(
     private static readonly TimeSpan PollInterval = TimeSpan.FromMinutes(2);
     private const string TelegramUrl = "https://t.me/s/binance_announcements";
     private const string Source = "binance_announcement";
+
+    // Nguồn #2 (redundancy): Binance CMS API — chính nguồn nuôi trang support announcements.
+    // catalogId=161 = "Delisting" category. Thường publish TRƯỚC telegram vài phút → giảm lag.
+    // APEX variant ưu tiên vì trả releaseDate (verified 2026-06-09); composite trả 200 nhưng
+    // publishDate=null → không dùng được cho watermark, chỉ là fallback (parser sẽ skip
+    // articles thiếu releaseDate).
+    private const string CmsSource = "binance_cms";
+    private static readonly string[] CmsUrls =
+    [
+        "https://www.binance.com/bapi/apex/v1/public/apex/cms/article/list/query?type=1&pageNo=1&pageSize=20&catalogId=161",
+        "https://www.binance.com/bapi/composite/v1/public/cms/article/catalog/list/query?catalogId=161&pageNo=1&pageSize=20",
+    ];
 
     // Red flag = bot must NOT trade this symbol. Tighter than initial draft because Binance
     // often posts "Notice of Removal of Margin Trading" which only removes MARGIN — spot still
@@ -57,6 +74,11 @@ public sealed partial class BinanceAnnouncementWorker(
         if (lower.Contains("margin trading")) return false;
         if (lower.Contains("isolated margin")) return false;
         if (lower.Contains("cross margin")) return false;
+        // "Binance Margin And Loan Will Delist X" = chỉ gỡ margin/loan support, spot vẫn trade.
+        // Bắt gặp thật trên CMS catalog 161 (2026-06-09) — thiếu exclusion này sẽ block oan.
+        if (lower.Contains("margin and loan")) return false;
+        if (lower.Contains("binance margin")) return false;
+        if (lower.Contains("binance loan")) return false;
         if (lower.Contains("leveraged token")) return false;
         if (lower.Contains("convert quote")) return false;
         if (lower.Contains("trading bots service")) return false;
@@ -67,7 +89,13 @@ public sealed partial class BinanceAnnouncementWorker(
         return RedFlagKeywords.Any(k => lower.Contains(k));
     }
 
-    private DateTimeOffset _lastSeenAt = DateTimeOffset.MinValue;
+    // Watermark riêng từng source: CMS releaseDate có thể sớm hơn telegram vài phút — chung
+    // 1 watermark sẽ làm message của source chậm hơn bị skip oan.
+    private readonly Dictionary<string, DateTimeOffset> _lastSeenBySource = new()
+    {
+        [Source] = DateTimeOffset.MinValue,
+        [CmsSource] = DateTimeOffset.MinValue,
+    };
     private bool _purgedThisRun;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -89,15 +117,16 @@ public sealed partial class BinanceAnnouncementWorker(
         http.Timeout = TimeSpan.FromSeconds(15);
         http.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 QuantFlowBots/1.0");
 
-        string html;
-        try { html = await http.GetStringAsync(TelegramUrl, ct); }
-        catch (Exception ex)
+        // Fetch song song 2 nguồn — nguồn nào fail thì nguồn kia vẫn chạy (redundancy).
+        var messages = new List<AnnouncementMessage>();
+        try
         {
-            logger.LogDebug(ex, "Failed to fetch Telegram preview");
-            return;
+            var html = await http.GetStringAsync(TelegramUrl, ct);
+            messages.AddRange(ParseMessages(html));
         }
+        catch (Exception ex) { logger.LogDebug(ex, "Failed to fetch Telegram preview"); }
 
-        var messages = ParseMessages(html);
+        messages.AddRange(await FetchCmsAnnouncementsAsync(http, ct));
         if (messages.Count == 0) return;
 
         using var scope = scopeFactory.CreateScope();
@@ -121,11 +150,12 @@ public sealed partial class BinanceAnnouncementWorker(
             .Select(s => new { s.Code, s.BaseAsset })
             .ToDictionaryAsync(s => s.BaseAsset.ToUpperInvariant(), s => s.Code, ct);
 
-        var maxSeenAt = _lastSeenAt;
+        var maxSeenBySource = new Dictionary<string, DateTimeOffset>(_lastSeenBySource);
         foreach (var msg in messages.OrderBy(m => m.At))
         {
-            if (msg.At <= _lastSeenAt) continue;
-            if (msg.At > maxSeenAt) maxSeenAt = msg.At;
+            var watermark = _lastSeenBySource.GetValueOrDefault(msg.SourceCode, DateTimeOffset.MinValue);
+            if (msg.At <= watermark) continue;
+            if (msg.At > maxSeenBySource.GetValueOrDefault(msg.SourceCode)) maxSeenBySource[msg.SourceCode] = msg.At;
 
             // Only process true delist / security events. Everything else (listings, AMAs,
             // partnership posts, pair-only removals, margin notices) is intentionally dropped —
@@ -138,20 +168,25 @@ public sealed partial class BinanceAnnouncementWorker(
             var targets = matchedSymbols;
             foreach (var symbol in targets)
             {
-                // Dedup: nếu (Source, Url, SymbolCode) đã có row → skip insert mà vẫn cập nhật
-                // EWMA + bus (để aggregator không bỏ sót khi process pull lại). Cost 1 query/symbol;
-                // 2-min poll cadence + ~4 symbols/message → không đáng kể.
-                var existed = !string.IsNullOrEmpty(msg.Url) && await db.SentimentEvents
-                    .AnyAsync(e => e.Source == Source && e.Url == msg.Url && e.SymbolCode == symbol, ct);
+                // Cross-source dedup: cùng 1 announcement xuất hiện ở CẢ telegram lẫn CMS
+                // (url khác nhau) → chỉ giữ 1 sentiment row. Window ±1 ngày quanh msg.At cover
+                // lag giữa 2 nguồn (vài phút) + restart re-process. Event mới thật sự (vd hack
+                // sau delist vài ngày) vẫn được ghi vì ngoài window.
+                var windowStart = msg.At.AddDays(-1);
+                var windowEnd = msg.At.AddDays(1);
+                var existed = await db.SentimentEvents.AnyAsync(e =>
+                    e.SymbolCode == symbol
+                    && (e.Source == Source || e.Source == CmsSource)
+                    && e.At >= windowStart && e.At <= windowEnd, ct);
 
-                var scored = scorer.Score(new SentimentInput(symbol, Source, msg.Text, msg.Url, msg.At, Tags: "binance"));
+                var scored = scorer.Score(new SentimentInput(symbol, msg.SourceCode, msg.Text, msg.Url, msg.At, Tags: "binance"));
                 agg.Apply(scored);
                 if (existed)
                 {
                     // Skip insert nhưng vẫn process risk gate (idempotent — BlockAsync sẽ no-op nếu
                     // đã block) để khôi phục state đúng khi Worker restart sau crash dài.
                     if (isRedFlag && symbol != "MARKET")
-                        await riskGate.BlockAsync(symbol, RedFlagReason(msg.Text), Source, msg.Url, ct);
+                        await riskGate.BlockAsync(symbol, RedFlagReason(msg.Text), msg.SourceCode, msg.Url, ct);
                     continue;
                 }
                 var symbolId = symbol == "MARKET" ? (int?)null
@@ -159,7 +194,7 @@ public sealed partial class BinanceAnnouncementWorker(
                 db.SentimentEvents.Add(new SentimentEvent
                 {
                     SymbolCode = symbol, SymbolId = symbolId,
-                    Source = Source,
+                    Source = msg.SourceCode,
                     Headline = scored.Headline.Length > 512 ? scored.Headline[..512] : scored.Headline,
                     Url = scored.Url,
                     Score = scored.Score, Magnitude = scored.Magnitude,
@@ -171,17 +206,81 @@ public sealed partial class BinanceAnnouncementWorker(
                 if (isRedFlag && symbol != "MARKET")
                 {
                     var newlyBlocked = !riskGate.IsBlocked(symbol);
-                    await riskGate.BlockAsync(symbol, RedFlagReason(msg.Text), Source, msg.Url, ct);
+                    await riskGate.BlockAsync(symbol, RedFlagReason(msg.Text), msg.SourceCode, msg.Url, ct);
                     if (newlyBlocked)
                     {
-                        logger.LogWarning("RED FLAG on {Symbol}: {Headline}", symbol, msg.Text);
+                        logger.LogWarning("RED FLAG on {Symbol} (via {Src}): {Headline}", symbol, msg.SourceCode, msg.Text);
                         await AutoCloseOpenPositionsAsync(scope, symbol, ct);
                     }
                 }
             }
         }
         await db.SaveChangesAsync(ct);
-        _lastSeenAt = maxSeenAt;
+        foreach (var (src, at) in maxSeenBySource) _lastSeenBySource[src] = at;
+    }
+
+    /// <summary>
+    /// Nguồn #2: Binance CMS announcement API (delisting catalog). Trả title + releaseDate +
+    /// link bài chính thức. Defensive parse — Binance có 2 response shape tùy endpoint variant:
+    /// <c>data.articles[]</c> hoặc <c>data.catalogs[].articles[]</c>.
+    /// </summary>
+    private async Task<List<AnnouncementMessage>> FetchCmsAnnouncementsAsync(HttpClient http, CancellationToken ct)
+    {
+        foreach (var url in CmsUrls)
+        {
+            try
+            {
+                using var req = new HttpRequestMessage(HttpMethod.Get, url);
+                // Thiếu UA browser → bapi trả 451/403 (bot detection) — giống AlphaMarketService.
+                req.Headers.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+                using var resp = await http.SendAsync(req, ct);
+                if (!resp.IsSuccessStatusCode) continue;
+
+                using var doc = System.Text.Json.JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct));
+                if (!doc.RootElement.TryGetProperty("data", out var data)) continue;
+
+                System.Text.Json.JsonElement articles = default;
+                var found = false;
+                if (data.ValueKind == System.Text.Json.JsonValueKind.Object)
+                {
+                    if (data.TryGetProperty("articles", out articles) && articles.ValueKind == System.Text.Json.JsonValueKind.Array)
+                        found = true;
+                    else if (data.TryGetProperty("catalogs", out var cats) && cats.ValueKind == System.Text.Json.JsonValueKind.Array)
+                    {
+                        foreach (var c in cats.EnumerateArray())
+                        {
+                            if (c.TryGetProperty("articles", out articles) && articles.ValueKind == System.Text.Json.JsonValueKind.Array)
+                            { found = true; break; }
+                        }
+                    }
+                }
+                if (!found) continue;
+
+                var list = new List<AnnouncementMessage>();
+                foreach (var a in articles.EnumerateArray())
+                {
+                    var title = a.TryGetProperty("title", out var t) ? t.GetString() : null;
+                    if (string.IsNullOrWhiteSpace(title)) continue;
+                    // releaseDate BẮT BUỘC — fallback UtcNow sẽ làm article luôn vượt watermark
+                    // → re-process mỗi 2 phút vĩnh viễn (composite variant trả publishDate=null,
+                    // skip ở đây để chỉ apex variant đi qua).
+                    if (!a.TryGetProperty("releaseDate", out var rd) || !rd.TryGetInt64(out var ms) || ms <= 0)
+                        continue;
+                    var at = DateTimeOffset.FromUnixTimeMilliseconds(ms);
+                    var code = a.TryGetProperty("code", out var cd) ? cd.GetString() : null;
+                    var articleUrl = string.IsNullOrEmpty(code)
+                        ? "https://www.binance.com/en/support/announcement/list/161"
+                        : $"https://www.binance.com/en/support/announcement/{code}";
+                    list.Add(new AnnouncementMessage(at, title!, articleUrl, CmsSource));
+                }
+                if (list.Count > 0) return list;
+            }
+            catch (Exception ex)
+            {
+                logger.LogDebug(ex, "CMS announcements fetch failed for {Url}", url);
+            }
+        }
+        return [];
     }
 
     /// <summary>
@@ -221,7 +320,7 @@ public sealed partial class BinanceAnnouncementWorker(
 
         var open = await db.Positions
             .Where(p => p.Status == PositionStatus.Open && p.Symbol!.Code == symbol)
-            .Select(p => new { p.Id, p.BotId, p.SymbolId, p.Quantity, p.EntryPrice })
+            .Select(p => new { p.Id, p.BotId, p.SymbolId, p.Side, p.Quantity, p.EntryPrice })
             .ToListAsync(ct);
 
         foreach (var p in open)
@@ -230,8 +329,11 @@ public sealed partial class BinanceAnnouncementWorker(
             {
                 // Use entry price as a fallback execution reference; paper-mode mark fills at this
                 // price, live executors override with current bid/ask inside the dispatcher chain.
+                // Close theo chiều ngược position: Long → Sell, Short → Buy (futures). Hardcode
+                // Sell sẽ TĂNG short thay vì đóng — bug nguy hiểm khi live futures.
+                var closeSide = p.Side == PositionSide.Short ? OrderSide.Buy : OrderSide.Sell;
                 await dispatcher.ExecuteAsync(new Application.Trading.PaperOrderRequest(
-                    p.BotId, null, p.SymbolId, OrderSide.Sell, p.Quantity, p.EntryPrice, "auto:risk_block"), ct);
+                    p.BotId, null, p.SymbolId, closeSide, p.Quantity, p.EntryPrice, "auto:risk_block"), ct);
                 logger.LogWarning("Auto-closed position {Pos} on {Symbol} due to risk flag", p.Id, symbol);
             }
             catch (Exception ex)
@@ -305,9 +407,9 @@ public sealed partial class BinanceAnnouncementWorker(
 
     /// <summary>Parses Telegram's t.me/s/&lt;channel&gt; HTML into messages. Cheap regex over the
     /// `tgme_widget_message` blocks — keeps us off heavier HTML libs since the markup is stable.</summary>
-    private static List<TelegramMessage> ParseMessages(string html)
+    private static List<AnnouncementMessage> ParseMessages(string html)
     {
-        var list = new List<TelegramMessage>();
+        var list = new List<AnnouncementMessage>();
         foreach (Match m in MessageRegex().Matches(html))
         {
             var dateStr = m.Groups["dt"].Value;
@@ -316,7 +418,7 @@ public sealed partial class BinanceAnnouncementWorker(
             if (!DateTimeOffset.TryParse(dateStr, out var at)) continue;
             var clean = StripHtml(rawText).Trim();
             if (clean.Length < 8) continue;
-            list.Add(new TelegramMessage(at, clean, url));
+            list.Add(new AnnouncementMessage(at, clean, url, Source));
         }
         return list;
     }
@@ -334,5 +436,5 @@ public sealed partial class BinanceAnnouncementWorker(
     [GeneratedRegex(@"tgme_widget_message_date""\s+href=""(?<url>[^""]+)"".*?datetime=""(?<dt>[^""]+)"".*?tgme_widget_message_text[^>]*>(?<text>.*?)</div>", RegexOptions.Singleline)]
     private static partial Regex MessageRegex();
 
-    private sealed record TelegramMessage(DateTimeOffset At, string Text, string Url);
+    private sealed record AnnouncementMessage(DateTimeOffset At, string Text, string Url, string SourceCode);
 }

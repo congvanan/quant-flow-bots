@@ -14,7 +14,11 @@ public static class SentimentEndpoints
         string? Source,
         DateTimeOffset? At,
         decimal? OverrideScore,
-        string? Tags);
+        string? Tags,
+        // true → đồng thời block symbol trong SymbolRiskGate: bot ngừng vào lệnh mới +
+        // RiskGateEnforcerWorker auto-close position mở trong ≤30s. Dùng khi tin tiêu cực
+        // đủ nghiêm trọng (vd DEV in vô hạn token) chứ không chỉ là sentiment data point.
+        bool? BlockTrading);
 
     public sealed record SentimentEventDto(
         Guid Id,
@@ -72,6 +76,7 @@ public static class SentimentEndpoints
             ISentimentScorer scorer,
             ISentimentAggregator agg,
             ISentimentBus bus,
+            QuantFlowBots.Application.Risk.SymbolRiskGate riskGate,
             CancellationToken ct) =>
         {
             if (string.IsNullOrWhiteSpace(req.SymbolCode) || string.IsNullOrWhiteSpace(req.Headline))
@@ -110,6 +115,13 @@ public static class SentimentEndpoints
             db.SentimentEvents.Add(row);
             await db.SaveChangesAsync(ct);
             await bus.PublishAsync(scored, ct);
+
+            // BlockTrading: ghi flag vào SymbolRiskGate (DB-persisted). API process update
+            // in-memory ngay; Worker process pick up qua RiskGateEnforcerWorker re-hydrate
+            // mỗi 30s sweep → bot ngừng vào lệnh + auto-close position trong ≤30s.
+            if (req.BlockTrading == true)
+                await riskGate.BlockAsync(scored.SymbolCode, "manual_block", "manual", req.Url, ct);
+
             return Results.Ok(new SentimentEventDto(row.Id, row.SymbolCode, row.Source, row.Headline, row.Url,
                 row.Score, row.Magnitude, row.Tags, row.At, row.IngestedAt));
         }).RequireAuthorization();

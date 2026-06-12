@@ -58,11 +58,18 @@ export function SentimentWidget() {
 
   const [symbol, setSymbol] = useState('BTCUSDT')
   const [headline, setHeadline] = useState('')
+  // Block bot trading: tin xấu nghiêm trọng (DEV mint vô hạn, rug…) → ngoài việc ghi
+  // sentiment, block luôn symbol trong RiskGate. Bot ngừng vào lệnh + auto-close ≤30s.
+  const [blockTrading, setBlockTrading] = useState(false)
   const [err, setErr] = useState<string | null>(null)
 
   const ingest = useMutation({
     mutationFn: (body: unknown) => api('/api/sentiment/manual', { method: 'POST', body: JSON.stringify(body) }),
-    onSuccess: () => { setHeadline(''); setErr(null); qc.invalidateQueries({ queryKey: ['sentiment'] }) },
+    onSuccess: () => {
+      setHeadline(''); setBlockTrading(false); setErr(null)
+      qc.invalidateQueries({ queryKey: ['sentiment'] })
+      qc.invalidateQueries({ queryKey: ['risk-flags'] })
+    },
     onError: (e) => setErr(e instanceof ApiError ? e.message : (e as Error).message),
   })
 
@@ -79,7 +86,8 @@ export function SentimentWidget() {
   function submit(e: React.FormEvent) {
     e.preventDefault()
     if (!headline.trim() || !symbol.trim()) return
-    ingest.mutate({ symbolCode: symbol.toUpperCase(), headline })
+    if (blockTrading && !confirm(`Block ${symbol.toUpperCase()}? Bot sẽ NGỪNG vào lệnh mới + tự đóng position mở trên symbol này trong ≤30s.`)) return
+    ingest.mutate({ symbolCode: symbol.toUpperCase(), headline, blockTrading })
   }
 
   const hasTops = bull.length > 0 || bear.length > 0
@@ -154,6 +162,19 @@ export function SentimentWidget() {
                 <Send className="h-3 w-3" />
               </Button>
             </form>
+            {/* Block trading: dùng khi tin đủ nghiêm trọng để bot phải tránh symbol này
+                (vd DEV mint vô hạn) — không chỉ là sentiment data point. */}
+            <label className="flex cursor-pointer items-center gap-1.5 text-[10px] text-muted-foreground">
+              <input
+                type="checkbox"
+                checked={blockTrading}
+                onChange={e => setBlockTrading(e.target.checked)}
+                className="h-3 w-3 accent-destructive"
+              />
+              <span className={blockTrading ? 'font-medium text-destructive' : ''}>
+                Block bot trading symbol này (ngừng lệnh mới + auto-close position ≤30s)
+              </span>
+            </label>
             {/* Examples as 2x2 grid — tighter than flex-wrap when card width is narrow. */}
             <div className="grid grid-cols-2 gap-1 text-[10px]">
               {EXAMPLES.map(ex => (

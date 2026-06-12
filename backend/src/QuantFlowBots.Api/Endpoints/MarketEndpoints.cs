@@ -10,6 +10,8 @@ namespace QuantFlowBots.Api.Endpoints;
 
 public static class MarketEndpoints
 {
+    public sealed record ManualRiskFlagRequest(string Symbol, string? Reason, string? Url);
+
     public static IEndpointRouteBuilder MapMarket(this IEndpointRouteBuilder app)
     {
         var grp = app.MapGroup("/api/market").WithTags("market");
@@ -180,6 +182,26 @@ public static class MarketEndpoints
         {
             var removed = await gate.UnblockAsync(symbol, ct);
             return removed ? Results.NoContent() : Results.NotFound();
+        }).RequireAuthorization();
+
+        // Manual block — user phát hiện tin xấu (DEV mint vô hạn, rug pull…) trước khi
+        // announcement worker bắt được. Block ngay: bot ngừng vào lệnh mới (Worker pick up
+        // ≤30s qua enforcer re-hydrate) + auto-close positions mở.
+        grp.MapPost("/risk-flags", async (
+            ManualRiskFlagRequest req,
+            QuantFlowBots.Application.Risk.SymbolRiskGate gate,
+            QuantFlowBotsDbContext db,
+            CancellationToken ct) =>
+        {
+            if (string.IsNullOrWhiteSpace(req.Symbol))
+                return Results.BadRequest(new { error = "symbol_required" });
+            var code = req.Symbol.Trim().ToUpperInvariant();
+            // Validate symbol tồn tại — tránh block typo rác vào bảng flags.
+            var exists = await db.Symbols.AnyAsync(s => s.Code == code, ct);
+            if (!exists) return Results.BadRequest(new { error = $"symbol_not_found: {code}" });
+
+            await gate.BlockAsync(code, string.IsNullOrWhiteSpace(req.Reason) ? "manual_block" : req.Reason!, "manual", req.Url, ct);
+            return Results.Ok(new { blocked = code });
         }).RequireAuthorization();
 
         grp.MapGet("/order-book-walls", (
