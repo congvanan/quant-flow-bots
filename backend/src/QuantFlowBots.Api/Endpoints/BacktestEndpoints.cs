@@ -19,7 +19,10 @@ public static class BacktestEndpoints
         DateTimeOffset To,
         decimal? InitialCapital,
         decimal? CommissionPercent,
-        string? ParametersJson);
+        string? ParametersJson,
+        // "Spot" (default) | "Futures". Futures: nến fapi, long+short, margin model + leverage.
+        string? Market,
+        decimal? Leverage);
 
     public sealed record BacktestSummaryDto(
         Guid Id,
@@ -42,6 +45,31 @@ public static class BacktestEndpoints
         string? Error);
 
     public sealed record BacktestDetailDto(BacktestSummaryDto Summary, IReadOnlyList<EquityPoint> EquityCurve);
+
+    public sealed record ScanRequest(
+        Guid StrategyId,
+        string Interval,
+        DateTimeOffset From,
+        DateTimeOffset To,
+        decimal? InitialCapital,
+        decimal? CommissionPercent,
+        string? ParametersJson,
+        string? Market,
+        decimal? Leverage,
+        // Universe: top N USDT pairs theo 24h quote volume (5–100). MinQuoteVolume lọc thêm đáy.
+        int? TopN,
+        decimal? MinQuoteVolume);
+
+    public sealed record ScanRowDto(
+        string Symbol,
+        bool Ok,
+        string? Error,
+        decimal? ReturnPercent,
+        decimal? MaxDrawdownPercent,
+        decimal? SharpeRatio,
+        int? TradeCount,
+        decimal? WinRatePercent,
+        decimal? FinalEquity);
 
     public static IEndpointRouteBuilder MapBacktests(this IEndpointRouteBuilder app)
     {
@@ -97,6 +125,12 @@ public static class BacktestEndpoints
             if (!Enum.TryParse<CandleInterval>(req.Interval, true, out var interval))
                 return Results.BadRequest(new { error = $"unknown_interval: {req.Interval}" });
             if (req.From >= req.To) return Results.BadRequest(new { error = "from_must_be_before_to" });
+            var market = MarketKind.Spot;
+            if (!string.IsNullOrWhiteSpace(req.Market) && !Enum.TryParse(req.Market, true, out market))
+                return Results.BadRequest(new { error = $"unknown_market: {req.Market} (Spot | Futures)" });
+            var leverage = Math.Clamp(req.Leverage ?? 1m, 1m, 125m);
+            if (market == MarketKind.Spot && leverage > 1m)
+                return Results.BadRequest(new { error = "leverage_requires_futures" });
 
             var backtest = new Backtest
             {
@@ -119,7 +153,8 @@ public static class BacktestEndpoints
                 var metrics = await runner.RunAsync(new BacktestRequest(
                     backtest.Id, backtest.StrategyId, backtest.SymbolId, backtest.Interval,
                     backtest.FromTime, backtest.ToTime,
-                    backtest.InitialCapital, backtest.CommissionPercent, backtest.ParametersJson), ct);
+                    backtest.InitialCapital, backtest.CommissionPercent, backtest.ParametersJson,
+                    market, leverage), ct);
 
                 backtest.Status = BacktestStatus.Completed;
                 backtest.ResultJson = JsonSerializer.Serialize(new
@@ -148,6 +183,104 @@ public static class BacktestEndpoints
                 await db.SaveChangesAsync(ct);
                 return Results.BadRequest(new { error = ex.Message });
             }
+        });
+
+        // Batch scan: chạy backtest cùng 1 strategy trên TOP-N coins theo 24h volume,
+        // trả bảng so sánh per-symbol (không persist từng row — tránh spam Recent list;
+        // muốn lưu + xem equity curve thì re-run single backtest cho symbol đó).
+        // Đây cũng là blueprint cho live bot multi-symbol sau này (Bot.SymbolFilterJson).
+        grp.MapPost("/scan", async (
+            ScanRequest req,
+            QuantFlowBotsDbContext db,
+            QuantFlowBots.Infrastructure.Exchanges.Binance.TickerSnapshotCache tickerCache,
+            IServiceScopeFactory scopeFactory,
+            ClaimsPrincipal user,
+            CancellationToken ct) =>
+        {
+            var userId = ParseUserId(user);
+            var strat = await db.Strategies.FirstOrDefaultAsync(s => s.Id == req.StrategyId && s.UserId == userId, ct);
+            if (strat is null) return Results.BadRequest(new { error = "strategy_not_found" });
+            if (!Enum.TryParse<CandleInterval>(req.Interval, true, out var interval))
+                return Results.BadRequest(new { error = $"unknown_interval: {req.Interval}" });
+            if (req.From >= req.To) return Results.BadRequest(new { error = "from_must_be_before_to" });
+            var market = MarketKind.Spot;
+            if (!string.IsNullOrWhiteSpace(req.Market) && !Enum.TryParse(req.Market, true, out market))
+                return Results.BadRequest(new { error = $"unknown_market: {req.Market}" });
+            var leverage = Math.Clamp(req.Leverage ?? 1m, 1m, 125m);
+            if (market == MarketKind.Spot && leverage > 1m)
+                return Results.BadRequest(new { error = "leverage_requires_futures" });
+
+            var topN = Math.Clamp(req.TopN ?? 50, 5, 100);
+            var minVol = req.MinQuoteVolume ?? 0m;
+
+            // Universe: top N USDT pairs theo 24h quote volume, loại stable/non-ASCII.
+            var tickers = await tickerCache.GetAsync(ct);
+            var universe = tickers
+                .Where(t => t.Symbol.EndsWith("USDT", StringComparison.OrdinalIgnoreCase) && t.QuoteVolume > 0)
+                .Where(t => t.Symbol.All(c => c < 128 && (char.IsLetterOrDigit(c) || c == '_')))
+                .Where(t => !ScanStableBases.Contains(t.Symbol[..^4]))
+                .Where(t => Math.Abs(t.LastPrice - 1m) > 0.03m)
+                .Where(t => t.QuoteVolume >= minVol)
+                .OrderByDescending(t => t.QuoteVolume)
+                .Take(topN)
+                .Select(t => t.Symbol.ToUpperInvariant())
+                .ToList();
+            if (universe.Count == 0) return Results.BadRequest(new { error = "universe_empty" });
+
+            var symbolIds = await db.Symbols
+                .Where(s => universe.Contains(s.Code))
+                .ToDictionaryAsync(s => s.Code, s => s.Id, StringComparer.OrdinalIgnoreCase, ct);
+
+            var paramJson = req.ParametersJson ?? strat.ParametersJson;
+            var capital = req.InitialCapital ?? 10_000m;
+            var fee = req.CommissionPercent ?? 0.1m;
+
+            // Scope per symbol: BacktestRunner + DbContext là scoped, KHÔNG share giữa các task
+            // song song (DbContext không thread-safe). Concurrency 4 — mỗi backtest tự fetch
+            // klines sequential, 4 luồng đủ ăn network mà không dồn ép Binance.
+            var rows = new System.Collections.Concurrent.ConcurrentBag<ScanRowDto>();
+            await Parallel.ForEachAsync(universe,
+                new ParallelOptions { MaxDegreeOfParallelism = 4, CancellationToken = ct },
+                async (sym, token) =>
+                {
+                    if (!symbolIds.TryGetValue(sym, out var symId))
+                    {
+                        rows.Add(new ScanRowDto(sym, false, "symbol_not_in_db", null, null, null, null, null, null));
+                        return;
+                    }
+                    try
+                    {
+                        using var scope = scopeFactory.CreateScope();
+                        var scopedRunner = scope.ServiceProvider.GetRequiredService<IBacktestRunner>();
+                        var metrics = await scopedRunner.RunAsync(new BacktestRequest(
+                            Guid.NewGuid(), strat.Id, symId, interval, req.From, req.To,
+                            capital, fee, paramJson, market, leverage), token);
+                        rows.Add(new ScanRowDto(sym, true, null,
+                            Math.Round(metrics.TotalReturnPercent, 2),
+                            Math.Round(metrics.MaxDrawdownPercent, 2),
+                            Math.Round(metrics.SharpeRatio, 2),
+                            metrics.TradeCount,
+                            Math.Round(metrics.WinRatePercent, 1),
+                            Math.Round(metrics.FinalEquity, 2)));
+                    }
+                    catch (Exception ex)
+                    {
+                        rows.Add(new ScanRowDto(sym, false, ex.Message, null, null, null, null, null, null));
+                    }
+                });
+
+            var ok = rows.Where(r => r.Ok).OrderByDescending(r => r.ReturnPercent).ToList();
+            var failed = rows.Where(r => !r.Ok).OrderBy(r => r.Symbol).ToList();
+            return Results.Ok(new
+            {
+                scannedAt = DateTimeOffset.UtcNow,
+                universe = universe.Count,
+                okCount = ok.Count,
+                failedCount = failed.Count,
+                filter = new { topN, minQuoteVolume = minVol, market = market.ToString(), leverage, interval = req.Interval, from = req.From, to = req.To },
+                results = ok,
+                failures = failed,
+            });
         });
 
         grp.MapDelete("/{id:guid}", async (Guid id, QuantFlowBotsDbContext db, ClaimsPrincipal user, CancellationToken ct) =>
@@ -199,6 +332,14 @@ public static class BacktestEndpoints
             b.Interval.ToString(), b.FromTime, b.ToTime, b.InitialCapital, b.Status.ToString(),
             finalEquity, ret, dd, sharpe, trades, winRate, b.CreatedAt, b.CompletedAt, b.ErrorMessage);
     }
+
+    // Stable/wrapped-USD bases loại khỏi scan universe — volume to nhưng không trade được.
+    // (Bản sao tối giản của MarketEndpoints.StableBaseAssets — list đó private.)
+    private static readonly HashSet<string> ScanStableBases = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "USDC", "FDUSD", "TUSD", "BUSD", "USDP", "USDD", "DAI", "SUSD", "USD1",
+        "EUR", "EURI", "AEUR", "EURT", "PYUSD", "RLUSD", "UUSD", "USTC",
+    };
 
     private static Guid ParseUserId(ClaimsPrincipal user)
         => Guid.TryParse(user.FindFirstValue(System.IdentityModel.Tokens.Jwt.JwtRegisteredClaimNames.Sub), out var id) ? id : Guid.Empty;

@@ -11,7 +11,11 @@ public sealed record BacktestRequest(
     DateTimeOffset To,
     decimal InitialCapital,
     decimal CommissionPercent,
-    string ParametersJson);
+    string ParametersJson,
+    // Market axis: Spot = long-only + nến spot api (behavior cũ). Futures = long+short,
+    // nến fapi, margin model + leverage. Default Spot để caller cũ không đổi.
+    MarketKind Market = MarketKind.Spot,
+    decimal Leverage = 1m);
 
 public sealed record BacktestMetrics(
     decimal FinalEquity,

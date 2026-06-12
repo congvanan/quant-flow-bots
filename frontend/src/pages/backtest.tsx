@@ -26,6 +26,13 @@ function Inner() {
   const [to, setTo] = useState(defaultTo())
   const [capital, setCapital] = useState('10000')
   const [fee, setFee] = useState('0.1')
+  // Futures mode: nến fapi + long/short + leverage. Spot: long-only (behavior cũ).
+  const [market, setMarket] = useState<'Spot' | 'Futures'>('Spot')
+  const [leverage, setLeverage] = useState('1')
+  // Scan mode: chạy strategy trên top-N coins theo 24h volume thay vì nhập 1 symbol.
+  const [mode, setMode] = useState<'single' | 'scan'>('single')
+  const [topN, setTopN] = useState('50')
+  const [scanResult, setScanResult] = useState<ScanResponse | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [detail, setDetail] = useState<BacktestDetail | null>(null)
   const [openId, setOpenId] = useState<string | null>(null)
@@ -77,6 +84,14 @@ function Inner() {
     onSuccess: () => qc.invalidateQueries({ queryKey: qk.backtests }),
   })
 
+  const scanMut = useMutation({
+    mutationFn: (body: unknown) =>
+      api<ScanResponse>('/api/backtests/scan', { method: 'POST', body: JSON.stringify(body) }),
+    onMutate: () => { setErr(null); setScanResult(null) },
+    onSuccess: (res) => setScanResult(res),
+    onError: (e) => setErr(e instanceof ApiError ? e.message : (e as Error).message),
+  })
+
   function removeBacktest(id: string) {
     if (!confirm('Xóa backtest này?')) return
     deleteMut.mutate(id)
@@ -86,19 +101,42 @@ function Inner() {
 
   function run(e: React.FormEvent) {
     e.preventDefault()
-    runMut.mutate({
+    const common = {
       strategyId,
-      symbolCode: symbol.toUpperCase(),
       interval,
       from: new Date(from).toISOString(),
       to: new Date(to).toISOString(),
       initialCapital: Number(capital),
       commissionPercent: Number(fee),
+      market,
+      leverage: market === 'Futures' ? Math.max(1, Math.min(125, Number(leverage) || 1)) : 1,
+    }
+    if (mode === 'scan') {
+      scanMut.mutate({ ...common, topN: Number(topN) })
+    } else {
+      runMut.mutate({ ...common, symbolCode: symbol.toUpperCase() })
+    }
+  }
+
+  // Click row trong scan result → chạy single backtest cho symbol đó để xem equity curve chi tiết.
+  function drillDown(sym: string) {
+    setMode('single')
+    setSymbol(sym)
+    runMut.mutate({
+      strategyId,
+      symbolCode: sym,
+      interval,
+      from: new Date(from).toISOString(),
+      to: new Date(to).toISOString(),
+      initialCapital: Number(capital),
+      commissionPercent: Number(fee),
+      market,
+      leverage: market === 'Futures' ? Math.max(1, Math.min(125, Number(leverage) || 1)) : 1,
     })
   }
 
   const load = (id: string) => setOpenId(id)
-  const running = runMut.isPending
+  const running = runMut.isPending || scanMut.isPending
 
   return (
     <main className="min-h-screen">
@@ -106,6 +144,50 @@ function Inner() {
       <div className="container grid gap-5 py-5 lg:grid-cols-[1fr_360px]">
         <div className="space-y-5">
           {detail && <ResultPanel detail={detail} />}
+
+          {scanResult && (
+            <Card>
+              <CardHeader className="flex flex-row items-center justify-between pb-2">
+                <CardTitle>
+                  Scan results — {scanResult.okCount}/{scanResult.universe} coins
+                  {scanResult.failedCount > 0 && <span className="ml-2 text-[11px] font-normal text-muted-foreground">({scanResult.failedCount} lỗi/thiếu data)</span>}
+                </CardTitle>
+                <Button size="sm" variant="ghost" className="h-7 text-[11px]" onClick={() => setScanResult(null)}>Đóng</Button>
+              </CardHeader>
+              <CardContent>
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>#</TableHead><TableHead>Symbol</TableHead>
+                      <TableHead>Return</TableHead><TableHead>MDD</TableHead>
+                      <TableHead>Sharpe</TableHead><TableHead>Trades</TableHead>
+                      <TableHead>Win rate</TableHead><TableHead>Final equity</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {scanResult.results.map((r, i) => (
+                      <TableRow key={r.symbol} className="cursor-pointer hover:bg-surface/60" onClick={() => drillDown(r.symbol)}>
+                        <TableCell className="text-muted-foreground">{i + 1}</TableCell>
+                        <TableCell className="font-mono font-medium">{r.symbol}</TableCell>
+                        <TableCell className={(r.returnPercent ?? 0) >= 0 ? 'text-up' : 'text-down'}>
+                          {(r.returnPercent ?? 0) >= 0 ? '+' : ''}{r.returnPercent?.toFixed(2)}%
+                        </TableCell>
+                        <TableCell className="text-down">{r.maxDrawdownPercent?.toFixed(2)}%</TableCell>
+                        <TableCell>{r.sharpeRatio?.toFixed(2)}</TableCell>
+                        <TableCell>{r.tradeCount}</TableCell>
+                        <TableCell>{r.winRatePercent?.toFixed(1)}%</TableCell>
+                        <TableCell className="font-mono">{r.finalEquity?.toFixed(0)}</TableCell>
+                      </TableRow>
+                    ))}
+                    {scanResult.results.length === 0 && (
+                      <TableRow><TableCell colSpan={8} className="text-muted-foreground">Không coin nào chạy thành công — kiểm tra khoảng thời gian / interval.</TableCell></TableRow>
+                    )}
+                  </TableBody>
+                </Table>
+                <p className="mt-2 text-[10px] text-muted-foreground">Click 1 row để chạy single backtest chi tiết (equity curve) cho symbol đó. Kết quả scan không lưu vào Recent.</p>
+              </CardContent>
+            </Card>
+          )}
 
           <Card>
             <CardHeader className="flex flex-row items-center justify-between pb-2">
@@ -172,10 +254,52 @@ function Inner() {
                 </select>
                 <Hint>Chiến lược + params đã setup ở trang Strategies. Backtest replay với chính params đó.</Hint>
               </Field>
-              <Field label="Symbol">
-                <input className="w-full rounded-md border px-3 py-2 font-mono text-sm uppercase" value={symbol} onChange={e => setSymbol(e.target.value)} required />
-                <Hint>Cặp giao dịch, vd BTCUSDT / ETHUSDT. Phải có trong /symbols.</Hint>
-              </Field>
+              {/* Mode: 1 symbol thủ công vs scan top-N coins theo 24h volume. */}
+              <div className="flex h-8 items-center rounded-sm border border-border bg-surface text-[12px] font-medium">
+                <button type="button" onClick={() => setMode('single')}
+                  className={`h-full flex-1 ${mode === 'single' ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground'}`}>
+                  Single symbol
+                </button>
+                <button type="button" onClick={() => setMode('scan')}
+                  className={`h-full flex-1 border-l border-border ${mode === 'scan' ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:text-foreground'}`}>
+                  Scan top coins
+                </button>
+              </div>
+
+              {mode === 'single' ? (
+                <Field label="Symbol">
+                  <input className="w-full rounded-md border px-3 py-2 font-mono text-sm uppercase" value={symbol} onChange={e => setSymbol(e.target.value)} required />
+                  <Hint>Cặp giao dịch, vd BTCUSDT / ETHUSDT. Phải có trong /symbols.</Hint>
+                </Field>
+              ) : (
+                <Field label="Universe">
+                  <select className="w-full rounded-sm border border-border bg-surface px-3 py-2 text-sm text-foreground" value={topN} onChange={e => setTopN(e.target.value)}>
+                    <option value="20">Top 20 coins (24h volume)</option>
+                    <option value="50">Top 50 coins</option>
+                    <option value="100">Top 100 coins</option>
+                  </select>
+                  <Hint>Chạy strategy trên toàn bộ universe, trả bảng so sánh. Top 50 × 30 ngày 15m ≈ 1-2 phút. Click symbol trong kết quả để xem equity curve chi tiết.</Hint>
+                </Field>
+              )}
+              <div className="grid grid-cols-2 gap-3">
+                <Field label="Market">
+                  <select className="w-full rounded-sm border border-border bg-surface px-3 py-2 text-sm text-foreground" value={market} onChange={e => setMarket(e.target.value as 'Spot' | 'Futures')}>
+                    <option value="Spot">Spot — long only</option>
+                    <option value="Futures">Futures — long + short</option>
+                  </select>
+                  <Hint>Futures: nến fapi, mở được cả short (Sell khi không có position), margin model.</Hint>
+                </Field>
+                <Field label="Leverage">
+                  <input
+                    className="w-full rounded-md border px-3 py-2 text-sm disabled:opacity-50"
+                    type="number" min={1} max={125} step={1}
+                    value={market === 'Futures' ? leverage : '1'}
+                    onChange={e => setLeverage(e.target.value)}
+                    disabled={market !== 'Futures'}
+                  />
+                  <Hint>{market === 'Futures' ? 'Notional = vốn × leverage. Lev cao → lãi/lỗ khuếch đại, dễ cháy (equity về 0 = liquidation).' : 'Chỉ dùng được ở Futures.'}</Hint>
+                </Field>
+              </div>
               <Field label="Interval">
                 <select className="w-full rounded-sm border border-border bg-surface px-3 py-2 text-sm text-foreground" value={interval} onChange={e => setInterval(e.target.value)}>
                   {INTERVALS.map(i => <option key={i} value={i}>{i}</option>)}
@@ -204,8 +328,14 @@ function Inner() {
               </div>
               {err && <p className="text-sm text-destructive">{err}</p>}
               <Button type="submit" className="w-full gap-2" disabled={running || !strategyId}>
-                <Play className="h-4 w-4" /> {running ? 'Running...' : 'Run backtest'}
+                <Play className="h-4 w-4" />
+                {running
+                  ? (mode === 'scan' ? `Scanning top ${topN}…` : 'Running...')
+                  : (mode === 'scan' ? `Scan top ${topN} coins` : 'Run backtest')}
               </Button>
+              {mode === 'scan' && running && (
+                <p className="text-[11px] text-muted-foreground">Đang chạy backtest trên {topN} coins (4 song song) — có thể mất 1-3 phút tùy khoảng thời gian…</p>
+              )}
             </form>
           </CardContent>
         </Card>
@@ -258,6 +388,27 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 
 function Hint({ children }: { children: React.ReactNode }) {
   return <p className="mt-1 text-[10px] leading-relaxed text-muted-foreground">{children}</p>
+}
+
+type ScanRow = {
+  symbol: string
+  ok: boolean
+  error?: string | null
+  returnPercent?: number | null
+  maxDrawdownPercent?: number | null
+  sharpeRatio?: number | null
+  tradeCount?: number | null
+  winRatePercent?: number | null
+  finalEquity?: number | null
+}
+
+type ScanResponse = {
+  scannedAt: string
+  universe: number
+  okCount: number
+  failedCount: number
+  results: ScanRow[]
+  failures: ScanRow[]
 }
 
 function fmtNum(v: number | null | undefined, suffix = ''): string {
