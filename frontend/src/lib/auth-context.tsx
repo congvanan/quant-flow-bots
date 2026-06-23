@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { api, getToken, setToken, type AuthResponse } from './api'
+import { api, getToken, setToken, type AuthResponse, type ForgotPasswordResponse } from './api'
 
 type AuthState = {
   userId: string | null
@@ -10,6 +10,8 @@ type AuthState = {
   loading: boolean
   login: (email: string, password: string) => Promise<void>
   register: (email: string, password: string, displayName: string) => Promise<void>
+  forgotPassword: (email: string) => Promise<ForgotPasswordResponse>
+  resetPassword: (email: string, token: string, newPassword: string) => Promise<void>
   logout: () => void
 }
 
@@ -59,6 +61,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     applyAuth(res)
   }, [applyAuth])
 
+  const forgotPassword = useCallback(async (email: string) => {
+    return api<ForgotPasswordResponse>('/api/auth/forgot-password', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    })
+  }, [])
+
+  const resetPassword = useCallback(async (email: string, token: string, newPassword: string) => {
+    await api('/api/auth/reset-password', {
+      method: 'POST',
+      body: JSON.stringify({ email, token, newPassword }),
+    })
+  }, [])
+
   const logout = useCallback(() => {
     setToken(null)
     setTokenState(null)
@@ -74,8 +90,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     loading,
     login,
     register,
+    forgotPassword,
+    resetPassword,
     logout,
-  }), [profile, token, loading, login, register, logout])
+  }), [profile, token, loading, login, register, forgotPassword, resetPassword, logout])
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
 }
