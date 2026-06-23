@@ -14,6 +14,7 @@ public sealed class QuantFlowBotsDbContext(DbContextOptions<QuantFlowBotsDbConte
     public DbSet<Candle> Candles => Set<Candle>();
     public DbSet<Strategy> Strategies => Set<Strategy>();
     public DbSet<Bot> Bots => Set<Bot>();
+    public DbSet<BotAccount> BotAccounts => Set<BotAccount>();
     public DbSet<BotRun> BotRuns => Set<BotRun>();
     public DbSet<Order> Orders => Set<Order>();
     public DbSet<Position> Positions => Set<Position>();

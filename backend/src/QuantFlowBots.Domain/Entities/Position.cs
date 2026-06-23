@@ -7,6 +7,9 @@ public sealed class Position
     public Guid Id { get; set; } = Guid.NewGuid();
     public Guid BotId { get; set; }
     public Guid? BotRunId { get; set; }
+    // Account (BotAccount.ApiKeyId) sở hữu vị thế này khi multi-account. Dùng để đóng đúng
+    // account + tính PnL/daily-loss riêng. null = single-account legacy.
+    public Guid? ApiKeyId { get; set; }
     public int SymbolId { get; set; }
     public TradingMode Mode { get; set; }
     public PositionSide Side { get; set; }

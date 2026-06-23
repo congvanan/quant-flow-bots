@@ -24,6 +24,7 @@ export const qk = {
   botRiskEvents: (id: string) => ['bot-risk-events', id] as const,
   botStats: (id: string) => ['bot-stats', id] as const,
   botsStatsSummary: ['bots-stats-summary'] as const,
+  botAccounts: (id: string) => ['bot-accounts', id] as const,
 
   // Strategies / backtests
   strategies: ['strategies'] as const,

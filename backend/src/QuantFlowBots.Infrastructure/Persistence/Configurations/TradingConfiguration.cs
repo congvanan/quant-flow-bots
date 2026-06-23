@@ -22,6 +22,7 @@ public sealed class OrderConfiguration : IEntityTypeConfiguration<Order>
         e.HasOne(x => x.Symbol).WithMany().HasForeignKey(x => x.SymbolId).OnDelete(DeleteBehavior.Restrict);
         e.HasIndex(x => x.ClientOrderId).IsUnique();
         e.HasIndex(x => new { x.BotId, x.CreatedAt });
+        e.HasIndex(x => x.ApiKeyId);
     }
 }
 
@@ -49,6 +50,7 @@ public sealed class PositionConfiguration : IEntityTypeConfiguration<Position>
         e.HasOne(x => x.BotRun).WithMany().HasForeignKey(x => x.BotRunId).OnDelete(DeleteBehavior.SetNull);
         e.HasOne(x => x.Symbol).WithMany().HasForeignKey(x => x.SymbolId).OnDelete(DeleteBehavior.Restrict);
         e.HasIndex(x => new { x.BotId, x.Status });
+        e.HasIndex(x => new { x.ApiKeyId, x.Status });
     }
 }
 

@@ -5,6 +5,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AuthGuard } from '@/components/auth-guard'
 import { NavBar } from '@/components/nav-bar'
 import { BotStatsPanel } from '@/components/bot-stats-panel'
+import { BotAccountsPanel } from '@/components/bot-accounts-panel'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -185,6 +186,8 @@ function Inner() {
         </Card>
 
         <BotStatsPanel botId={bot.id} />
+
+        <BotAccountsPanel botId={bot.id} executionMarket={bot.executionMarket} />
 
         {bot.runMode === 'LiveTrading' && (() => {
           const isSpot = livePos && !('error' in livePos) && 'kind' in livePos && livePos.kind === 'spot'

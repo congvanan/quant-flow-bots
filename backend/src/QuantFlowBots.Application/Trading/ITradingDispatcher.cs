@@ -16,4 +16,6 @@ public sealed record LiveTradingGateResult(bool Allowed, string? Reason);
 public interface ILiveTradingGate
 {
     Task<LiveTradingGateResult> EvaluateAsync(Guid botId, CancellationToken cancellationToken);
+    // Gate trực tiếp 1 api key (multi-account: mỗi account key phải qua gate riêng).
+    Task<LiveTradingGateResult> EvaluateKeyAsync(Guid apiKeyId, CancellationToken cancellationToken);
 }

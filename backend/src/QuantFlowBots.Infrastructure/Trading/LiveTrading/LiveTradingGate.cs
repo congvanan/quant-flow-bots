@@ -29,9 +29,13 @@ public sealed class LiveTradingGate(QuantFlowBotsDbContext db) : ILiveTradingGat
         var bot = await db.Bots.AsNoTracking().FirstOrDefaultAsync(b => b.Id == botId, cancellationToken);
         if (bot is null) return new(false, "bot_not_found");
         if (bot.ApiKeyId is null) return new(false, "no_api_key_linked");
+        return await EvaluateKeyAsync(bot.ApiKeyId.Value, cancellationToken);
+    }
 
+    public async Task<LiveTradingGateResult> EvaluateKeyAsync(Guid apiKeyId, CancellationToken cancellationToken)
+    {
         var key = await db.ApiKeys.Include(k => k.Exchange).AsNoTracking()
-            .FirstOrDefaultAsync(k => k.Id == bot.ApiKeyId, cancellationToken);
+            .FirstOrDefaultAsync(k => k.Id == apiKeyId, cancellationToken);
         if (key is null) return new(false, "api_key_missing");
         if (!key.IsActive) return new(false, "api_key_inactive");
         if (key.Mode != Domain.Enums.TradingMode.Live) return new(false, "api_key_not_live_mode");

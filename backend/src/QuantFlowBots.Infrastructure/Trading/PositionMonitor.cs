@@ -171,7 +171,8 @@ public sealed class PositionMonitor(
             var allRemaining = qty >= p.Quantity;
             var reason = allRemaining ? $"take_profit_final" : $"take_profit_lvl_{idx + 1}";
             var result = await executor.ExecuteAsync(new PaperOrderRequest(
-                p.BotId, null, p.SymbolId, OrderSide.Sell, qty, bid, $"auto:{reason}"), cancellationToken);
+                p.BotId, null, p.SymbolId, OrderSide.Sell, qty, bid, $"auto:{reason}",
+                PositionId: p.PositionId), cancellationToken);
 
             // Mark level hit + persist
             var updated = new TpLevel(hit.ProfitPercent, hit.ClosePercent, hit.ClosePrice, hit.CloseQty, DateTimeOffset.UtcNow);
@@ -208,7 +209,8 @@ public sealed class PositionMonitor(
             using var scope = scopeFactory.CreateScope();
             var executor = scope.ServiceProvider.GetRequiredService<ITradingDispatcher>();
             var result = await executor.ExecuteAsync(new PaperOrderRequest(
-                p.BotId, null, p.SymbolId, OrderSide.Sell, p.Quantity, bid, $"auto:{reason}"), cancellationToken);
+                p.BotId, null, p.SymbolId, OrderSide.Sell, p.Quantity, bid, $"auto:{reason}",
+                PositionId: p.PositionId), cancellationToken);
 
             using var db = scope.ServiceProvider.GetRequiredService<QuantFlowBotsDbContext>();
             var posRow = await db.Positions.FirstOrDefaultAsync(x => x.Id == p.PositionId, cancellationToken);

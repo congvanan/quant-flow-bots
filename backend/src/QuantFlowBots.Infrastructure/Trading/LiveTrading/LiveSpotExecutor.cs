@@ -34,9 +34,20 @@ public sealed class LiveSpotExecutor(
         var bot = await db.Bots.Include(b => b.Symbol).FirstOrDefaultAsync(b => b.Id == req.BotId, cancellationToken);
         if (bot is null) return Reject(req, "bot_not_found");
         if (bot.Symbol is null) return Reject(req, "symbol_missing");
-        if (bot.ApiKeyId is null) return Reject(req, "no_api_key_linked");
 
-        var key = await db.ApiKeys.Include(k => k.Exchange).FirstOrDefaultAsync(k => k.Id == bot.ApiKeyId, cancellationToken);
+        // Multi-account: lệnh con mang req.ApiKeyId; đóng lệnh dùng account của vị thế. null = legacy.
+        var keyId = req.ApiKeyId ?? bot.ApiKeyId;
+        if (req.Side == OrderSide.Sell)
+        {
+            var posKey = await db.Positions
+                .Where(p => p.BotId == bot.Id && p.SymbolId == req.SymbolId && p.Status == PositionStatus.Open
+                    && p.Mode == TradingMode.Live && (req.PositionId == null || p.Id == req.PositionId))
+                .Select(p => p.ApiKeyId).FirstOrDefaultAsync(cancellationToken);
+            if (posKey is not null) keyId = posKey;
+        }
+        if (keyId is null) return Reject(req, "no_api_key_linked");
+
+        var key = await db.ApiKeys.Include(k => k.Exchange).FirstOrDefaultAsync(k => k.Id == keyId, cancellationToken);
         if (key?.Exchange is null) return Reject(req, "api_key_or_exchange_missing");
 
         var cred = new SpotCredential(
@@ -45,11 +56,11 @@ public sealed class LiveSpotExecutor(
             key.Exchange.RestBaseUrl);
 
         return req.Side == OrderSide.Buy
-            ? await OpenAsync(req, bot, cred, cancellationToken)
+            ? await OpenAsync(req, bot, cred, keyId.Value, cancellationToken)
             : await CloseAsync(req, bot, cred, cancellationToken);
     }
 
-    private async Task<PaperOrderResult> OpenAsync(PaperOrderRequest req, Bot bot, SpotCredential cred, CancellationToken cancellationToken)
+    private async Task<PaperOrderResult> OpenAsync(PaperOrderRequest req, Bot bot, SpotCredential cred, Guid keyId, CancellationToken cancellationToken)
     {
         var symbol = bot.Symbol!;
         var validation = OrderValidator.Validate(symbol, req.Quantity, req.Price);
@@ -60,6 +71,7 @@ public sealed class LiveSpotExecutor(
         {
             BotId = req.BotId,
             BotRunId = req.BotRunId,
+            ApiKeyId = keyId,
             SymbolId = req.SymbolId,
             Mode = TradingMode.Live,
             Side = OrderSide.Buy,
@@ -104,6 +116,7 @@ public sealed class LiveSpotExecutor(
         {
             BotId = bot.Id,
             BotRunId = req.BotRunId,
+            ApiKeyId = keyId,
             SymbolId = req.SymbolId,
             Mode = TradingMode.Live,
             Side = PositionSide.Long,
@@ -144,6 +157,7 @@ public sealed class LiveSpotExecutor(
         {
             BotId = req.BotId,
             BotRunId = req.BotRunId,
+            ApiKeyId = req.ApiKeyId,
             SymbolId = req.SymbolId,
             Mode = TradingMode.Live,
             Side = OrderSide.Sell,
@@ -175,7 +189,8 @@ public sealed class LiveSpotExecutor(
         await db.SaveChangesAsync(cancellationToken);
 
         var pos = await db.Positions
-            .Where(p => p.BotId == bot.Id && p.SymbolId == req.SymbolId && p.Status == PositionStatus.Open && p.Mode == TradingMode.Live)
+            .Where(p => p.BotId == bot.Id && p.SymbolId == req.SymbolId && p.Status == PositionStatus.Open && p.Mode == TradingMode.Live
+                && (req.PositionId == null || p.Id == req.PositionId))
             .FirstOrDefaultAsync(cancellationToken);
         decimal pnl = 0m;
         if (pos is not null)

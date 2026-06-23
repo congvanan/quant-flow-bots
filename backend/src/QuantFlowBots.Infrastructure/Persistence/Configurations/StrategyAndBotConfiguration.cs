@@ -55,6 +55,23 @@ public sealed class BotConfiguration : IEntityTypeConfiguration<Bot>
     }
 }
 
+public sealed class BotAccountConfiguration : IEntityTypeConfiguration<BotAccount>
+{
+    public void Configure(EntityTypeBuilder<BotAccount> e)
+    {
+        e.ToTable("bot_accounts");
+        e.HasKey(x => x.Id);
+        e.Property(x => x.Label).HasMaxLength(128);
+        e.Property(x => x.Weight).HasColumnType("numeric(12,4)");
+        e.Property(x => x.BaseEquityUsdt).HasColumnType("numeric(28,12)");
+        e.Property(x => x.KillSwitchReason).HasMaxLength(256);
+        e.HasOne(x => x.Bot).WithMany().HasForeignKey(x => x.BotId).OnDelete(DeleteBehavior.Cascade);
+        e.HasOne(x => x.ApiKey).WithMany().HasForeignKey(x => x.ApiKeyId).OnDelete(DeleteBehavior.Cascade);
+        // Một account không gắn 2 lần vào cùng 1 bot.
+        e.HasIndex(x => new { x.BotId, x.ApiKeyId }).IsUnique();
+    }
+}
+
 public sealed class BotRunConfiguration : IEntityTypeConfiguration<BotRun>
 {
     public void Configure(EntityTypeBuilder<BotRun> e)

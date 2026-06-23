@@ -33,6 +33,7 @@ public sealed class PaperOrderExecutor(
                 {
                     BotId = req.BotId,
                     BotRunId = req.BotRunId,
+                    ApiKeyId = req.ApiKeyId,
                     SymbolId = req.SymbolId,
                     Mode = TradingMode.Paper,
                     Side = req.Side,
@@ -59,6 +60,7 @@ public sealed class PaperOrderExecutor(
         {
             BotId = req.BotId,
             BotRunId = req.BotRunId,
+            ApiKeyId = req.ApiKeyId,
             SymbolId = req.SymbolId,
             Mode = TradingMode.Paper,
             Side = req.Side,
@@ -74,8 +76,12 @@ public sealed class PaperOrderExecutor(
         };
         db.Orders.Add(order);
 
+        // Scope theo account (multi-account) + theo PositionId nếu close targeted. Single-account
+        // (req.ApiKeyId == null) khớp mọi vị thế của bot như cũ.
         var open = await db.Positions
-            .Where(p => p.BotId == req.BotId && p.SymbolId == req.SymbolId && p.Status == PositionStatus.Open)
+            .Where(p => p.BotId == req.BotId && p.SymbolId == req.SymbolId && p.Status == PositionStatus.Open
+                && (req.ApiKeyId == null || p.ApiKeyId == req.ApiKeyId)
+                && (req.PositionId == null || p.Id == req.PositionId))
             .FirstOrDefaultAsync(cancellationToken);
 
         decimal realizedPnl = 0;
@@ -93,6 +99,7 @@ public sealed class PaperOrderExecutor(
                 {
                     BotId = req.BotId,
                     BotRunId = req.BotRunId,
+                    ApiKeyId = req.ApiKeyId,
                     SymbolId = req.SymbolId,
                     Mode = TradingMode.Paper,
                     Side = PositionSide.Long,

@@ -9,7 +9,12 @@ public sealed record PaperOrderRequest(
     OrderSide Side,
     decimal Quantity,
     decimal Price,
-    string Reason);
+    string Reason,
+    // Multi-account fan-out (xem [[project-quantflow-multi-account]]):
+    //   ApiKeyId  = account thực thi lệnh con này. null = single-account legacy (dùng Bot.ApiKeyId).
+    //   PositionId = đóng đúng vị thế này (close targeted theo account). null = tự tìm vị thế mở.
+    Guid? ApiKeyId = null,
+    Guid? PositionId = null);
 
 public sealed record PaperOrderResult(
     Guid OrderId,

@@ -126,6 +126,7 @@ app.MapAuth();
 app.MapMarket();
 app.MapStrategies();
 app.MapBots();
+app.MapBotAccounts();
 app.MapBacktests();
 app.MapSettings();
 app.MapUserSettings();

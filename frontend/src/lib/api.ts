@@ -72,6 +72,11 @@ export type AuthResponse = {
   displayName: string
 }
 
+export type ForgotPasswordResponse = {
+  message: string
+  resetToken?: string
+}
+
 export type MarketTicker = {
   symbol: string
   lastPrice: number
@@ -186,6 +191,25 @@ export type BotDto = {
   breakEvenOffsetPercent: number
   lastError?: string | null
   createdAt: string
+}
+
+export type BotAccountDto = {
+  id: string
+  botId: string
+  apiKeyId: string
+  exchangeCode: string
+  keyLabel: string
+  label: string
+  weight: number
+  baseEquityUsdt: number
+  isActive: boolean
+  killSwitchTrippedAt?: string | null
+  killSwitchReason?: string | null
+  openPositions: number
+  realizedPnl: number
+  pnlToday: number
+  totalTrades: number
+  winRatePercent: number
 }
 
 export type TpLevelInput = { profitPercent: number; closePercent: number }

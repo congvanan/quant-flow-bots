@@ -64,7 +64,7 @@ public sealed class RiskGateEnforcerWorker(
         // hold all symbols in memory.
         var victims = await db.Positions
             .Where(p => p.Status == PositionStatus.Open && blocked.Contains(p.Symbol!.Code))
-            .Select(p => new { p.Id, p.BotId, p.SymbolId, p.Side, p.Quantity, p.EntryPrice, SymbolCode = p.Symbol!.Code })
+            .Select(p => new { p.Id, p.BotId, p.ApiKeyId, p.SymbolId, p.Side, p.Quantity, p.EntryPrice, SymbolCode = p.Symbol!.Code })
             .ToListAsync(ct);
 
         if (victims.Count == 0) return;
@@ -78,8 +78,10 @@ public sealed class RiskGateEnforcerWorker(
                 // Sell — đúng cho spot/long nhưng với futures SHORT thì Sell làm TĂNG short
                 // thay vì đóng. Bug nghiêm trọng khi live futures.
                 var closeSide = p.Side == PositionSide.Short ? OrderSide.Buy : OrderSide.Sell;
+                // PositionId + ApiKeyId: đóng đúng vị thế của đúng account (multi-account safety).
                 await dispatcher.ExecuteAsync(new PaperOrderRequest(
-                    p.BotId, null, p.SymbolId, closeSide, p.Quantity, p.EntryPrice, "auto:risk_block"), ct);
+                    p.BotId, null, p.SymbolId, closeSide, p.Quantity, p.EntryPrice, "auto:risk_block",
+                    ApiKeyId: p.ApiKeyId, PositionId: p.Id), ct);
                 await botBus.PublishAsync(new BotEvent(p.BotId, "auto_close",
                     $"risk_block enforcer closed {p.SymbolCode} qty={p.Quantity}", DateTimeOffset.UtcNow), ct);
                 logger.LogWarning("Enforcer closed position {Pos} on {Symbol}", p.Id, p.SymbolCode);
