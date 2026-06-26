@@ -12,6 +12,10 @@ out/
 .env.*.local
 appsettings.Development.json
 appsettings.Local.json
+.tunnel-token
+
+# Local tunnel binary (54MB) — tải riêng, không commit
+cloudflared.exe
 
 # IDE / editor
 *.user

@@ -125,7 +125,7 @@ Write-Host 'Postgres is healthy.' -ForegroundColor Green
 # is loaded by ASP.NET — `dotnet watch run` spawned via Start-Process does NOT inherit
 # launchSettings.json automatically.
 $envSetup = "`$env:ASPNETCORE_ENVIRONMENT='Development'; `$env:DOTNET_ENVIRONMENT='Development';"
-Start-Process powershell -ArgumentList '-NoExit', '-Command', "$envSetup `$env:QFB_PROCESS='api'; cd '$apiDir'; Write-Host '=== Quant Flow Bots API (http://localhost:5087)  [watch mode] ===' -ForegroundColor Green; dotnet watch run --urls http://localhost:5087"
+Start-Process powershell -ArgumentList '-NoExit', '-Command', "$envSetup `$env:QFB_PROCESS='api'; cd '$apiDir'; Write-Host '=== Quant Flow Bots API (http://0.0.0.0:5087 = localhost + LAN cho mobile)  [watch mode] ===' -ForegroundColor Green; dotnet watch run --urls http://0.0.0.0:5087"
 Start-Process powershell -ArgumentList '-NoExit', '-Command', "$envSetup `$env:QFB_PROCESS='worker'; cd '$workerDir'; Write-Host '=== Quant Flow Bots Worker  [watch mode] ===' -ForegroundColor Magenta; dotnet watch run"
 Start-Process powershell -ArgumentList '-NoExit', '-Command', "cd '$frontendDir'; Write-Host '=== Quant Flow Bots Frontend (http://localhost:3000, or next free port) ===' -ForegroundColor Cyan; npm run dev -- --port 3000"
 

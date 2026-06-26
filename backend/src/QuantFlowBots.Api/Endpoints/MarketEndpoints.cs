@@ -12,6 +12,50 @@ public static class MarketEndpoints
 {
     public sealed record ManualRiskFlagRequest(string Symbol, string? Reason, string? Url);
 
+    /// Nến Futures USDT-M từ fapi production (public, không cần key). Dùng cho Alpha tokens
+    /// vốn chỉ list futures. Client "alpha-public" — không tính vào weight spot.
+    private static async Task<IReadOnlyList<CandleData>> LoadFuturesCandlesAsync(
+        IHttpClientFactory httpFactory, string symbol, CandleInterval interval, int limit, CancellationToken ct)
+    {
+        var http = httpFactory.CreateClient("alpha-public");
+        http.Timeout = TimeSpan.FromSeconds(15);
+        var iv = ToBinanceInterval(interval);
+        var url = $"https://fapi.binance.com/fapi/v1/klines?symbol={symbol.ToUpperInvariant()}&interval={iv}&limit={limit}";
+        using var resp = await http.GetAsync(url, ct);
+        resp.EnsureSuccessStatusCode();
+        using var doc = System.Text.Json.JsonDocument.Parse(await resp.Content.ReadAsStringAsync(ct));
+        var list = new List<CandleData>();
+        if (doc.RootElement.ValueKind != System.Text.Json.JsonValueKind.Array) return list;
+        foreach (var row in doc.RootElement.EnumerateArray())
+        {
+            if (row.ValueKind != System.Text.Json.JsonValueKind.Array || row.GetArrayLength() < 9) continue;
+            list.Add(new CandleData(
+                symbol.ToUpperInvariant(), interval,
+                DateTimeOffset.FromUnixTimeMilliseconds(row[0].GetInt64()),
+                DateTimeOffset.FromUnixTimeMilliseconds(row[6].GetInt64()),
+                ParseDec(row[1]), ParseDec(row[2]), ParseDec(row[3]), ParseDec(row[4]),
+                ParseDec(row[5]), ParseDec(row[7]), row[8].GetInt32(), IsClosed: true));
+        }
+        return list;
+
+        static decimal ParseDec(System.Text.Json.JsonElement el) =>
+            decimal.TryParse(el.GetString(), System.Globalization.NumberStyles.Any,
+                System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : 0m;
+    }
+
+    private static string ToBinanceInterval(CandleInterval interval) => interval switch
+    {
+        CandleInterval.OneMinute => "1m",
+        CandleInterval.FiveMinutes => "5m",
+        CandleInterval.FifteenMinutes => "15m",
+        CandleInterval.ThirtyMinutes => "30m",
+        CandleInterval.OneHour => "1h",
+        CandleInterval.TwoHours => "2h",
+        CandleInterval.FourHours => "4h",
+        CandleInterval.OneDay => "1d",
+        _ => "15m",
+    };
+
     public static IEndpointRouteBuilder MapMarket(this IEndpointRouteBuilder app)
     {
         var grp = app.MapGroup("/api/market").WithTags("market");
@@ -71,13 +115,15 @@ public static class MarketEndpoints
         {
             if (!Guid.TryParse(user.FindFirst(System.IdentityModel.Tokens.Jwt.JwtRegisteredClaimNames.Sub)?.Value, out var userId))
                 return Results.Unauthorized();
-            var todayUtc = DateTimeOffset.UtcNow.Date;
+            // DateTimeOffset (UTC midnight) — KHÔNG truyền DateTime .Date (Kind=Unspecified) trực
+            // tiếp vào query timestamptz vì Npgsql sẽ ném → 500. Cùng pattern với RiskEngine.
+            var dayStart = new DateTimeOffset(DateTimeOffset.UtcNow.UtcDateTime.Date, TimeSpan.Zero);
             var openCount = await db.Positions
                 .Where(p => p.Status == PositionStatus.Open && p.Bot!.UserId == userId)
                 .CountAsync(ct);
             var todayPnl = await db.Positions
                 .Where(p => p.Status == PositionStatus.Closed
-                    && p.ClosedAt != null && p.ClosedAt >= todayUtc
+                    && p.ClosedAt != null && p.ClosedAt >= dayStart
                     && p.Bot!.UserId == userId)
                 .SumAsync(p => (decimal?)p.RealizedPnl, ct) ?? 0m;
             return Results.Ok(new { openPositions = openCount, todayPnl });
@@ -394,13 +440,31 @@ public static class MarketEndpoints
             string symbol,
             string interval,
             int? limit,
+            string? market,
             IExchangeClient exchange,
+            IHttpClientFactory httpFactory,
             CancellationToken ct) =>
         {
             if (!Enum.TryParse<CandleInterval>(interval, true, out var iv))
                 return Results.BadRequest(new { error = $"Unknown interval: {interval}" });
-            var candles = await exchange.GetCandlesAsync(symbol, iv, null, null, limit ?? 200, ct);
-            return Results.Ok(candles);
+            var take = Math.Clamp(limit ?? 200, 1, 1000);
+            // market=futures: nến từ fapi (Alpha tokens chỉ có futures, KHÔNG có spot → spot trả 400).
+            var isFutures = string.Equals(market, "futures", StringComparison.OrdinalIgnoreCase);
+            try
+            {
+                var candles = isFutures
+                    ? await LoadFuturesCandlesAsync(httpFactory, symbol, iv, take, ct)
+                    : (IReadOnlyList<CandleData>)await exchange.GetCandlesAsync(symbol, iv, null, null, take, ct);
+                return Results.Ok(candles);
+            }
+            catch (HttpRequestException)
+            {
+                // Symbol không tồn tại ở market này → 404 gọn thay vì 500 stacktrace.
+                return Results.NotFound(new
+                {
+                    error = $"Không có dữ liệu nến cho {symbol.ToUpperInvariant()} ({(isFutures ? "futures" : "spot")})",
+                });
+            }
         });
 
         // VWAP (rational) vs MA (emotion) cross scanner. Scans top-100 USDT pairs.
