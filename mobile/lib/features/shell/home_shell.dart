@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../core/realtime/bot_feed.dart';
 import '../dashboard/presentation/dashboard_screen.dart';
 import '../market/presentation/market_screen.dart';
 import '../bots/presentation/bots_list_screen.dart';
@@ -7,13 +9,13 @@ import '../backtest/presentation/backtest_screen.dart';
 import '../more/presentation/more_screen.dart';
 
 /// Khung chính: bottom navigation 5 tab, giữ state mỗi tab bằng IndexedStack.
-class HomeShell extends StatefulWidget {
+class HomeShell extends ConsumerStatefulWidget {
   const HomeShell({super.key});
   @override
-  State<HomeShell> createState() => _HomeShellState();
+  ConsumerState<HomeShell> createState() => _HomeShellState();
 }
 
-class _HomeShellState extends State<HomeShell> {
+class _HomeShellState extends ConsumerState<HomeShell> {
   int _index = 0;
 
   static const _tabs = <Widget>[
@@ -26,6 +28,8 @@ class _HomeShellState extends State<HomeShell> {
 
   @override
   Widget build(BuildContext context) {
+    // Kích hoạt feed SignalR mức app (refresh list/dashboard khi có thay đổi từ web).
+    ref.watch(botFeedProvider);
     return Scaffold(
       body: IndexedStack(index: _index, children: _tabs),
       bottomNavigationBar: NavigationBar(

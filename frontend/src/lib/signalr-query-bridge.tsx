@@ -31,6 +31,7 @@ export function SignalRQueryBridge({ children }: { children: React.ReactNode }) 
       }
       if (e.kind === 'started' || e.kind === 'stopped') {
         qc.invalidateQueries({ queryKey: ['bots'] })
+        qc.invalidateQueries({ queryKey: ['bots-stats-summary'] })
         qc.invalidateQueries({ queryKey: ['bot', e.botId] })
       }
       if (e.kind === 'signal') {

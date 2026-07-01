@@ -1,6 +1,8 @@
 using System.Security.Claims;
 using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.SignalR;
 using Microsoft.EntityFrameworkCore;
+using QuantFlowBots.Api.Hubs;
 using QuantFlowBots.Application.Streaming;
 using QuantFlowBots.Application.Trading;
 using QuantFlowBots.Domain.Entities;
@@ -331,7 +333,7 @@ public static class BotEndpoints
             return Results.Ok(events);
         });
 
-        auth.MapPost("/{id:guid}/start", async (Guid id, QuantFlowBotsDbContext db, BotRuntime runtime, IBotEventBus bus, ClaimsPrincipal user, CancellationToken ct) =>
+        auth.MapPost("/{id:guid}/start", async (Guid id, QuantFlowBotsDbContext db, BotRuntime runtime, IBotEventBus bus, IHubContext<MarketHub> hub, ClaimsPrincipal user, CancellationToken ct) =>
         {
             var userId = ParseUserId(user);
             var bot = await db.Bots
@@ -345,11 +347,13 @@ public static class BotEndpoints
             db.BotRuns.Add(new BotRun { BotId = bot.Id, StartedAt = DateTimeOffset.UtcNow });
             await db.SaveChangesAsync(ct);
             runtime.Activate(bot);
-            await bus.PublishAsync(new BotEvent(bot.Id, "started", $"bot {bot.Name} started", DateTimeOffset.UtcNow), ct);
+            var evt = new BotEvent(bot.Id, "started", $"bot {bot.Name} started", DateTimeOffset.UtcNow);
+            await bus.PublishAsync(evt, ct);
+            await BroadcastBotEventAsync(hub, userId, evt, ct);
             return Results.Ok(new { state = bot.State.ToString() });
         });
 
-        auth.MapPost("/{id:guid}/stop", async (Guid id, QuantFlowBotsDbContext db, BotRuntime runtime, IBotEventBus bus, ClaimsPrincipal user, CancellationToken ct) =>
+        auth.MapPost("/{id:guid}/stop", async (Guid id, QuantFlowBotsDbContext db, BotRuntime runtime, IBotEventBus bus, IHubContext<MarketHub> hub, ClaimsPrincipal user, CancellationToken ct) =>
         {
             var userId = ParseUserId(user);
             var bot = await db.Bots.FirstOrDefaultAsync(b => b.Id == id && b.UserId == userId, ct);
@@ -360,7 +364,9 @@ public static class BotEndpoints
             if (run is not null) { run.StoppedAt = DateTimeOffset.UtcNow; run.StopReason = "user_stop"; }
             await db.SaveChangesAsync(ct);
             runtime.Deactivate(bot.Id);
-            await bus.PublishAsync(new BotEvent(bot.Id, "stopped", $"bot {bot.Name} stopped", DateTimeOffset.UtcNow), ct);
+            var evt = new BotEvent(bot.Id, "stopped", $"bot {bot.Name} stopped", DateTimeOffset.UtcNow);
+            await bus.PublishAsync(evt, ct);
+            await BroadcastBotEventAsync(hub, userId, evt, ct);
             return Results.Ok(new { state = bot.State.ToString() });
         });
 
@@ -732,4 +738,13 @@ public static class BotEndpoints
 
     private static Guid ParseUserId(ClaimsPrincipal user)
         => Guid.TryParse(user.FindFirstValue(System.IdentityModel.Tokens.Jwt.JwtRegisteredClaimNames.Sub), out var id) ? id : Guid.Empty;
+
+    /// Đẩy 'bot' event tới MỌI client của user (web list/dashboard + mobile) để cập nhật
+    /// realtime, không chỉ trang chi tiết (group bot:{id}). API không có broadcaster nền nên
+    /// các thay đổi lifecycle từ endpoint (start/stop) phải tự gửi ở đây. Best-effort, nuốt lỗi.
+    private static async Task BroadcastBotEventAsync(IHubContext<MarketHub> hub, Guid userId, BotEvent evt, CancellationToken ct)
+    {
+        try { await hub.Clients.User(userId.ToString()).SendAsync("bot", evt, ct); }
+        catch { /* realtime là phụ — không được làm hỏng request chính */ }
+    }
 }

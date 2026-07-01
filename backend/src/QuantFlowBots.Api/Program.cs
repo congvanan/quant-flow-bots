@@ -75,6 +75,8 @@ builder.Services.AddSignalR().AddJsonProtocol(opt =>
 {
     opt.PayloadSerializerOptions.Converters.Add(new JsonStringEnumConverter());
 });
+// UserIdentifier = JWT 'sub' để Clients.User / group "user:{sub}" hoạt động (xem SubUserIdProvider).
+builder.Services.AddSingleton<Microsoft.AspNetCore.SignalR.IUserIdProvider, QuantFlowBots.Api.Hubs.SubUserIdProvider>();
 
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
